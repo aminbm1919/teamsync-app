@@ -1,0 +1,10 @@
+{
+    "name": "teamsync-presence",
+    "displayName": "TeamSync Presence",
+    "description": "Tells TeamSync which project files are open in this editor, so the other machine sees work the moment it starts.",
+    "publisher": "teamsync-local",
+    "version": "1.0.0",
+    "engines": { "vscode": "^1.60.0" },
+    "main": "./extension.js",
+    "activationEvents": ["onStartupFinished"]
+}
