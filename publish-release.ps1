@@ -26,6 +26,31 @@ $ErrorActionPreference = 'Stop'
 function Step($t) { Write-Host "==> $t" -ForegroundColor Cyan }
 function Die($t)  { Write-Host $t -ForegroundColor Red; exit 1 }
 
+# Version rule, set 2026-08-29: only the FIRST part may pass 9. The line runs
+# 2.1.0 ... 2.1.9, then 2.2.0, on to 2.9.9, then 3.0.0.
+#
+# Checked FIRST, before the package and the key are even looked for, because
+# this is the one thing that needs no files to judge and the one mistake that
+# costs most: a tag, once pushed, is what every installed copy compares
+# itself against forever. Checking it after the staleness test - where it
+# first sat - meant a bad number was reported only after a full rebuild.
+$vparts = $Version.TrimStart('v', 'V') -split '\.'
+if ($vparts.Count -ne 3 -or ($vparts | Where-Object { $_ -notmatch '^\d+$' })) {
+    Die "Version must be three numbers, like 2.1.0. Got: $Version"
+}
+if ([int]$vparts[1] -gt 9 -or [int]$vparts[2] -gt 9) {
+    # The carry has to cascade, not happen once: 2.9.10 rolls the third part
+    # into the second, which then also passes 9 and rolls into the first.
+    # A single carry suggests 2.10.0 - a number this very rule forbids, which
+    # would send the reader round the loop again.
+    $a, $b, $c = [int]$vparts[0], [int]$vparts[1], [int]$vparts[2]
+    if ($c -gt 9) { $c = 0; $b++ }
+    if ($b -gt 9) { $b = 0; $a++ }
+    Die ("Only the first part may pass 9, so $Version is not a valid version." +
+         "`nAfter x.y.9 comes x.(y+1).0, and after x.9.9 comes (x+1).0.0." +
+         "`nYou probably want: $a.$b.$c")
+}
+
 $exe = Join-Path $PSScriptRoot 'dist\TeamSync.zip'
 if (-not (Test-Path $exe)) { Die "No package found at $exe - run build.ps1 first." }
 

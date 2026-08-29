@@ -1,7 +1,8 @@
 # AGENTS.md
 
-**This is a team project.** Two people work on this folder at the same time, on two
-machines, each with their own AI agent.
+**This is a team project.** Several people work on this folder at the same time,
+one machine each, every one of them with their own AI agent. There may be two of
+you or ten - run `who.ps1` to find out rather than assuming.
 
 ## Read this first
 
@@ -24,9 +25,18 @@ Fill this in after the first design note, not before — guessing boundaries ear
 creates more conflicts than it prevents. Until it is filled, ask before editing
 anything you did not create.
 
+One owner per module, and the table records only what the PEOPLE decided — an
+agent may propose a split, never enact one.
+
 | Path | Owner |
 | --- | --- |
 | *(unassigned)* | |
+
+## Names
+
+Everybody here publishes under a different `git config user.name`; that name is
+what ties presence, file warnings and authorship together. One person on two
+machines is fine and gets a number automatically (`amin`, `amin-2`).
 
 ## Project notes
 

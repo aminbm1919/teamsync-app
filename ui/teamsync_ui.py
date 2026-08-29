@@ -34,7 +34,11 @@ except Exception:                     # packaging or antivirus can lose it
     sv_ttk = None
 
 APP_NAME = "TeamSync"
-APP_VERSION = "2.0.28"          # compared against the newest release tag
+# Version rule, set 2026-08-29: only the FIRST part may pass 9. The second
+# and third are single digits, so the line runs 2.1.0 ... 2.1.9, then 2.2.0,
+# on to 2.9.9, and then 3.0.0. publish-release.ps1 refuses anything else, so
+# the rule cannot be broken by forgetting it.
+APP_VERSION = "2.1.0"           # compared against the newest release tag
 UPDATE_REPO = "aminbm1919/teamsync-app"   # private; both sides have access
 # The app ships as a folder, not a single file. A one-file build unpacks ~970
 # files into %TEMP% on every launch, and on a machine whose antivirus interferes
@@ -93,13 +97,23 @@ def save_config(cfg):
 
 
 def git(repo, *args):
-    """Run one git command in repo. Returns stdout stripped, or '' on failure."""
+    """Run one git command in repo. Returns stdout stripped, or '' on failure.
+
+    Decoded as UTF-8 explicitly, not through the machine's locale. Python's
+    text mode would use the console codepage - cp1252 here - and git speaks
+    UTF-8, so every non-latin byte came back as mojibake: a file reading
+    "سطر از امین" arrived as "Ø³Ø·Ø± Ø§Ø² Ø§Ù…ÛŒÙ†". Harmless while
+    this helper was only counting commits and reading ref names, which are
+    ascii; wrong the moment it is asked for a file's CONTENT.
+    """
     try:
         out = subprocess.run(
-            ["git"] + list(args), cwd=repo, capture_output=True, text=True,
+            ["git"] + list(args), cwd=repo, capture_output=True,
             creationflags=CREATE_NO_WINDOW,
         )
-        return out.stdout.strip() if out.returncode == 0 else ""
+        if out.returncode != 0:
+            return ""
+        return out.stdout.decode("utf-8", "replace").strip()
     except Exception:
         return ""
 
@@ -120,28 +134,80 @@ def pid_alive(pid):
         return False
 
 
+def process_start(pid):
+    """When a process began, as a Windows FILETIME, or None.
+
+    Windows hands process ids out again after a process ends, so an id alone
+    cannot prove a particular program is the one holding it. The birth moment
+    can: a recycled id belongs to a process that started later.
+    """
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    k32 = ctypes.windll.kernel32
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, int(pid))
+    if not handle:
+        return None
+    try:
+        created = ctypes.c_ulonglong()
+        rest = [ctypes.c_ulonglong() for _ in range(3)]
+        ok = k32.GetProcessTimes(handle, ctypes.byref(created),
+                                 *[ctypes.byref(x) for x in rest])
+        return created.value if ok else None
+    finally:
+        k32.CloseHandle(handle)
+
+
 def daemon_pid(repo):
     """PID of a live engine for this repo, or None.
 
-    The engine rewrites .teamsync.lock every second, so a fresh mtime plus a live
-    PID means an engine is covering this folder - possibly one started by a
-    window that has since been closed.
+    Decided on the PROCESS, not on how recently it managed to write. The old
+    rule refused to believe in an engine whose lock was more than 30 seconds
+    old - but the engine writes that lock once per pass, and a pass with many
+    network round trips takes longer than that. A healthy engine then looked
+    dead, and the window offered to start a second one on the same folder;
+    two engines committing and rebasing one worktree is the single thing git
+    cannot survive.
+
+    The engine records its start time in the lock, so a recycled id is not
+    mistaken for it. A lock written before that scheme keeps the old rule.
     """
     lock = os.path.join(repo, ".teamsync.lock")
     try:
-        import time
-        if time.time() - os.path.getmtime(lock) > 30:
-            return None
         # utf-8-sig, not utf-8: Windows PowerShell 5.1 writes a byte-order mark
         # at the head of the file, which makes the first line "﻿pid=..." and
         # not "pid=...". Read as plain utf-8 this returned None for a perfectly
         # healthy engine, so a window could never reconnect to one left running
         # in the background - the whole point of the engine being detached.
+        fields = {}
         with open(lock, "r", encoding="utf-8-sig", errors="replace") as fh:
             for line in fh:
-                if line.startswith("pid="):
-                    pid = int(line.strip().split("=", 1)[1])
-                    return pid if pid_alive(pid) else None
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    fields.setdefault(k, v)
+        pid = int(fields.get("pid", ""))
+        if not pid_alive(pid):
+            return None
+        recorded = fields.get("started", "")
+        if recorded:
+            # The engine writes .NET's round-trip form; compare through a
+            # parsed value so the two clocks are the same clock.
+            import datetime as _dt
+            try:
+                want = _dt.datetime.fromisoformat(recorded)
+            except ValueError:
+                return pid
+            actual = process_start(pid)
+            if actual is None:
+                return None
+            # FILETIME: 100 ns ticks since 1601-01-01, in UTC.
+            born = (_dt.datetime(1601, 1, 1, tzinfo=_dt.timezone.utc)
+                    + _dt.timedelta(microseconds=actual / 10))
+            if want.tzinfo is None:
+                want = want.astimezone()
+            return pid if abs((born - want).total_seconds()) < 2 else None
+        import time
+        if time.time() - os.path.getmtime(lock) > 30:
+            return None
+        return pid
     except Exception:
         pass
     return None
@@ -167,54 +233,338 @@ def kill_pid(pid):
                    capture_output=True, creationflags=CREATE_NO_WINDOW)
 
 
-def partner_presence(repo, my_name):
-    """Who else has beaten recently, and how long ago.
+ONLINE_SECONDS = 150       # the engine beats every 60 s; this allows two misses
+
+
+def team_presence(repo, my_name):
+    """Everyone else on this project, freshest beat first.
 
     The engine publishes a heartbeat as a ref named
-    refs/teamsync/presence/<name>/<unix-seconds> and fetches the other side's.
-    A ref carries no date, so the timestamp lives in the name. Returns
-    (name, seconds_ago) for the freshest partner beat, or (None, None).
+    refs/teamsync/presence/<name>/<unix-seconds> and fetches everybody's. A
+    ref carries no date, so the timestamp lives in the name.
+
+    Reading was the only part of this that ever assumed two people: the refs
+    have always been one-per-person, and it costs the same to read sixty of
+    them as two (measured: 55 ms at two people, 59 ms at sixty - which is the
+    cost of starting git at all, not of the refs).
+
+    Returns a list of dicts: {name, ago, online}, sorted online-first and then
+    by how recently each was seen. A person who beat twice - which happens
+    while an old beat is being swept - is counted once, at their freshest.
     """
     import time
     out = git(repo, "for-each-ref", "--format=%(refname)", "refs/teamsync/presence")
-    best_name, best_ts = None, -1
+    freshest = {}
     for line in out.splitlines():
         parts = line.strip().split("/")
         if len(parts) < 5:
             continue
         name, ts = parts[3], parts[4]
-        if name == my_name:
+        if not name or name == my_name:
             continue
         try:
             ts = int(ts)
         except ValueError:
             continue
-        if ts > best_ts:
-            best_name, best_ts = name, ts
-    if best_name is None:
+        if ts > freshest.get(name, -1):
+            freshest[name] = ts
+    now = int(time.time())
+    people = [{"name": n, "ago": max(0, now - ts), "online": (now - ts) <= ONLINE_SECONDS}
+              for n, ts in freshest.items()]
+    people.sort(key=lambda p: (not p["online"], p["ago"], p["name"].lower()))
+    return people
+
+
+def partner_presence(repo, my_name):
+    """The single freshest other person, as the old two-person display wanted.
+
+    Kept because several callers still speak of one partner; it is now just
+    the head of the list.
+    """
+    people = team_presence(repo, my_name)
+    if not people:
         return None, None
-    return best_name, max(0, int(time.time()) - best_ts)
+    return people[0]["name"], people[0]["ago"]
+
+
+def sanitise_name(text):
+    """The one spelling of a person's name that every layer agrees on.
+
+    The engine publishes presence under this form, and a commit's author name
+    put through it lands on the same string - measured on a live project: an
+    author written "Ali Reza" and a presence name "Ali-Reza" are one person.
+    Author EMAIL is deliberately not the key: measured on the live project,
+    one person commits under an address belonging to somebody else entirely,
+    so email answers the wrong question.
+    """
+    import re
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", text or "").strip("-")
+
+
+# One walk of the last week answers all three windows, so the cascade costs a
+# single git call. Cached because it feeds a display that redraws every four
+# seconds while the answer changes on the scale of minutes.
+_activity_cache = {"repo": None, "at": 0, "value": {}}
+ACTIVITY_WINDOWS = (3 * 3600, 24 * 3600, 7 * 86400)
+
+
+def recent_activity(repo, max_age=60):
+    """How much work each person has landed lately, per time window.
+
+    Returns {name: (count_3h, count_24h, count_7d)} keyed by the sanitised
+    name, so it joins straight onto presence.
+
+    Cost, measured on a repository of 50,000 commits spread over two years:
+    the windowed walk takes ~57 ms, the same as the `git status` this app
+    already runs every few seconds, because `--since` stops walking once it
+    is past the cutoff. Walking the whole history instead takes 360 ms, which
+    is why the window is never widened to "all time".
+
+    "Pushes" cannot be counted from a clone - a push leaves no record a
+    clone can see, only the commits it carried. Commits are the honest
+    substitute, and for this app they are nearly the same thing: the engine
+    publishes what it commits, within minutes.
+    """
+    import time
+    now = time.time()
+    if (_activity_cache["repo"] == repo
+            and now - _activity_cache["at"] < max_age):
+        return _activity_cache["value"]
+    out = git(repo, "log", "--all", f"--since={ACTIVITY_WINDOWS[-1]} seconds ago",
+              "--format=%at %an")
+    counts = {}
+    for line in out.splitlines():
+        stamp, _, who = line.strip().partition(" ")
+        try:
+            age = now - int(stamp)
+        except ValueError:
+            continue
+        name = sanitise_name(who)
+        if not name:
+            continue
+        row = counts.setdefault(name, [0, 0, 0])
+        for i, window in enumerate(ACTIVITY_WINDOWS):
+            if age <= window:
+                row[i] += 1
+    counts = {n: tuple(v) for n, v in counts.items()}
+    _activity_cache.update({"repo": repo, "at": now, "value": counts})
+    return counts
+
+
+def rank_by_activity(names, activity):
+    """Order people by recent work, widening the window only as far as needed.
+
+    The rule, in the owner's words: take the busiest of the last three hours;
+    if that leaves the list short because everyone else did nothing, fill the
+    rest from the last day, then from the last week. Nobody appears twice,
+    and the widening never re-orders those already placed - a person who was
+    busy in the last three hours outranks yesterday's hardest worker, which
+    is the whole point of asking about three hours first.
+
+    People with no commits in any window come last, alphabetically, so the
+    list is stable rather than arbitrary. They are never dropped: the full
+    list has to be able to reach everybody.
+    """
+    ordered, placed = [], set()
+    for i in range(len(ACTIVITY_WINDOWS)):
+        tier = [n for n in names
+                if n not in placed and activity.get(n, (0, 0, 0))[i] > 0]
+        tier.sort(key=lambda n: (-activity[n][i], n.lower()))
+        ordered.extend(tier)
+        placed.update(tier)
+    ordered.extend(sorted((n for n in names if n not in placed), key=str.lower))
+    return ordered
+
+
+def team_pending_files(repo, my_name):
+    """Who has hands on which files right now, decoded from the pending refs.
+
+    The engine keeps refs/teamsync/pending/<name>/<hex-of-path> fetched; this
+    reads and decodes them, KEEPING the name. With two people the name could
+    be dropped - there was only one other person it could be - and the old
+    reader did drop it. With five, "somebody is editing this" is not an
+    answer to the question being asked.
+
+    Returns {name: [files]}, names sorted, files sorted within each.
+    """
+    out = git(repo, "for-each-ref", "--format=%(refname)", "refs/teamsync/pending")
+    by_person = {}
+    for line in out.splitlines():
+        parts = line.strip().split("/", 4)
+        if len(parts) < 5 or not parts[3] or parts[3] == my_name:
+            continue
+        try:
+            path = bytes.fromhex(parts[4]).decode("utf-8", "replace")
+        except ValueError:
+            continue
+        by_person.setdefault(parts[3], set()).add(path)
+    return {n: sorted(f) for n, f in sorted(by_person.items(), key=lambda kv: kv[0].lower())}
+
+
+def team_conflicts(repo, my_name):
+    """Who is untangling a conflict right now, and in which files.
+
+    A conflict lives on one machine: everybody else's repository is fine and
+    the shared branch is a consistent state, so nothing about this stops
+    anyone working. What it buys them is knowledge - adding more changes to a
+    file somebody is mid-way through resolving is how the next conflict gets
+    made.
+
+    Returns {name: [files]}, names sorted, files sorted within each.
+    """
+    out = git(repo, "for-each-ref", "--format=%(refname)", "refs/teamsync/conflict")
+    by_person = {}
+    for line in out.splitlines():
+        parts = line.strip().split("/", 4)
+        if len(parts) < 5 or not parts[3] or parts[3] == my_name:
+            continue
+        try:
+            path = bytes.fromhex(parts[4]).decode("utf-8", "replace")
+        except ValueError:
+            continue
+        by_person.setdefault(parts[3], set()).add(path)
+    return {n: sorted(f) for n, f in sorted(by_person.items(), key=lambda kv: kv[0].lower())}
+
+
+def _ref_hex(text):
+    return text.encode("utf-8").hex()
+
+
+def conflict_volunteers(repo):
+    """Who has put their hand up for which conflict.
+
+    One person volunteering is the whole point: with five people reading the
+    same list, two of them settling the same file separately is not help, it
+    is a second conflict. So the claim is public and exclusive - everybody
+    else sees the volunteer's name instead of a button.
+
+    Travels as a ref like everything else here:
+      refs/teamsync/volunteer/<owner>/<hex-path>/<volunteer>
+
+    Returns {(owner, path): volunteer}.
+    """
+    out = {}
+    for line in (git(repo, "for-each-ref", "--format=%(refname)",
+                     "refs/teamsync/volunteer") or "").splitlines():
+        # refs / teamsync / volunteer / owner / hexpath / volunteer = 6 parts.
+        parts = line.strip().split("/", 5)
+        if len(parts) < 6:
+            continue
+        owner, hexpath, volunteer = parts[3], parts[4], parts[5]
+        try:
+            path = bytes.fromhex(hexpath).decode("utf-8", "replace")
+        except ValueError:
+            continue
+        if owner and path and volunteer:
+            out[(owner, path)] = volunteer
+    return out
+
+
+def set_volunteer(repo, owner, path, me, volunteering):
+    """Put our hand up for somebody's conflict, or take it back down.
+
+    Pushed straight to the shared repository rather than left for the engine:
+    a claim that arrives four minutes later is not a claim, it is a race.
+    Returns True when GitHub took it.
+    """
+    ref = f"refs/teamsync/volunteer/{owner}/{_ref_hex(path)}/{me}"
+    args = (["push", "-q", "origin", f"HEAD:{ref}"] if volunteering
+            else ["push", "-q", "origin", f":{ref}"])
+    out = subprocess.run(["git"] + args, cwd=repo, capture_output=True,
+                         creationflags=CREATE_NO_WINDOW)
+    if out.returncode == 0:
+        git(repo, "fetch", "-q", "--prune", "origin",
+            "+refs/teamsync/volunteer/*:refs/teamsync/volunteer/*")
+    return out.returncode == 0
+
+
+def conflict_report(repo, who, path):
+    """The three versions of one teammate's conflicted file, for anybody.
+
+    A conflict happens in one person's working tree, but the material of it
+    does not have to stay there. Two of the three versions are in every
+    clone already - THEIRS is the shared branch, BASE is the common start -
+    and the engine pushes the third, the stuck person's own side, as
+    refs/teamsync/conflictwork/<name>. So this can be assembled by any
+    teammate without touching their machine.
+
+    What another person CANNOT do is finish somebody else's rebase: that
+    lives in their git directory. What they CAN do is decide the final text
+    and publish it, which is the useful half.
+
+    Returns {"mine": ..., "theirs": ..., "base": ...}; a value is None when
+    that side does not exist (a file one person added, for instance).
+    """
+    work = f"refs/teamsync/conflictwork/{who}"
+    tip = git(repo, "rev-parse", "--verify", "-q", work)
+    branch = "origin/main"
+    out = {"mine": None, "theirs": None, "base": None}
+    if not tip:
+        return out
+    base = git(repo, "merge-base", tip, branch)
+    for key, rev in (("mine", tip), ("theirs", branch), ("base", base)):
+        if not rev:
+            continue
+        # show writes nothing and fails when the path is absent on that side,
+        # which is a real answer - "this side has no version of this file".
+        text = git(repo, "show", f"{rev}:{path}")
+        out[key] = text if text else None
+    return out
+
+
+def write_conflict_report(repo, who, path, folder):
+    """Lay one teammate's conflict out as files, the same shape as our own.
+
+    Named from the whole path with folders joined by __, so two files of the
+    same name in different folders cannot overwrite each other - the same
+    rule the engine's own export follows.
+    """
+    sides = conflict_report(repo, who, path)
+    flat = path.replace("\\", "__").replace("/", "__")
+    stem, dot, ext = flat.rpartition(".")
+    stem = stem or flat
+    ext = (dot + ext) if dot else ""
+    os.makedirs(folder, exist_ok=True)
+    written = {}
+    for key, label in (("mine", "THEIRS"), ("theirs", "SHARED"), ("base", "BASE")):
+        # From the READER's point of view the stuck person's side is
+        # "theirs" - calling it MINE here would name it after somebody who is
+        # not in the room.
+        body = sides.get(key)
+        target = os.path.join(folder, f"{stem}.{label}{ext}")
+        with open(target, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(body if body is not None
+                     else "<< this side has no version of this file >>\n")
+        written[label] = target
+    note = os.path.join(folder, "CONFLICT.md")
+    with open(note, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(
+            f"# {who} is stuck on {path}\n\n"
+            f"This is their conflict, read from GitHub. Their own machine is the\n"
+            f"only one that can finish their merge - but you can decide what the\n"
+            f"file should say and publish it yourself, and their side will take\n"
+            f"your version when it arrives.\n\n"
+            f"- `{stem}.THEIRS{ext}` - {who}'s version, not yet published anywhere else\n"
+            f"- `{stem}.SHARED{ext}` - what is on the shared branch right now\n"
+            f"- `{stem}.BASE{ext}` - the version both of those started from\n\n"
+            f"## To resolve it for them\n\n"
+            f"Edit `{path}` in the project until it carries every intent you find\n"
+            f"above, then press Publish now. Nothing here is a lock: if they finish\n"
+            f"first, theirs lands and this is wasted work, not damage.\n")
+    written["CONFLICT.md"] = note
+    return written
 
 
 def partner_pending_files(repo, my_name):
-    """Files the partner has hands on right now, decoded from the pending refs.
+    """Every file anybody else has hands on, without saying who.
 
-    The engine keeps refs/teamsync/pending/<name>/<hex-of-path> fetched; this
-    just reads and decodes them. It is the data behind the live "working on"
-    line - the user asked for a standing display, not a log line that scrolls
-    past in a foreign language.
+    Kept for the places that only need to know whether anything at all is in
+    other hands.
     """
-    out = git(repo, "for-each-ref", "--format=%(refname)", "refs/teamsync/pending")
-    files = []
-    for line in out.splitlines():
-        parts = line.strip().split("/", 4)
-        if len(parts) < 5 or parts[3] == my_name:
-            continue
-        try:
-            files.append(bytes.fromhex(parts[4]).decode("utf-8", "replace"))
-        except ValueError:
-            continue
-    return sorted(set(files))
+    files = set()
+    for paths in team_pending_files(repo, my_name).values():
+        files.update(paths)
+    return sorted(files)
 
 
 def clear_my_presence(repo, my_name):
@@ -1079,13 +1429,34 @@ MONO    = ("Consolas", 9)
 HELP = {
     'start_new': (
         "Start a new shared project.\n\n"
-        "You pick a folder that already holds your work. That folder and everything under it becomes a PRIVATE repository on your GitHub account, your teammate is invited, and syncing starts.\n\n"
+        "You pick a folder that already holds your work. That folder and everything under it becomes a PRIVATE repository on your GitHub account - only the people you invite can see it - and syncing starts.\n\n"
+        "People you have shared with before are listed for you: click a name, or Ctrl+click several. For somebody new, type their GitHub username. Inviting nobody now is fine; people can be added later.\n\n"
         "Once per project. The repository name must be plain lower-case latin - if the folder name is not, type one yourself."
     ),
     'join': (
         "Join a project someone shared with you.\n\n"
-        "Type the repository name they gave you. It downloads into any empty folder you choose - anywhere on your disk. A short latin path without spaces gives the fewest surprises.\n\n"
-        "Accept the GitHub invitation first. Until you do, GitHub answers \"repository not found\", which looks like a typo but is not."
+        "It offers two ways in. The first is the requests waiting for you: someone invited you through GitHub, and their request is listed with their name and the repository, to accept or decline.\n\n"
+        "The second is by hand, for when no request shows up and you already know the repository name and whose account it is on. It downloads into any empty folder you choose; a short latin path without spaces gives the fewest surprises.\n\n"
+        "A repository you were never invited to answers \"repository not found\", which looks like a typo but is not. If you expected a request and see none, this machine may be signed in to a different GitHub account - check with: gh auth status"
+    ),
+    'addpeople': (
+        "Add people to this project.\n\n"
+        "A project does not have to be finished being shared on the day it started. This invites more people to the one that is already running - the same tick-box list you saw when you created it.\n\n"
+        "They get a GitHub invitation, which appears under \"Requests received\" in their own TeamSync. Accepting downloads the project and starts their syncing.\n\n"
+        "Only whoever created the project can invite. If that is not you, the button says so instead of failing after you press it."
+    ),
+    'conflicts': (
+        "Conflicts on this project.\n\n"
+        "Everything that is stuck right now, whoever it belongs to. A conflict happens inside one person's folder, and only that machine can finish its merge - but nobody should have to wait in the dark for it.\n\n"
+        "For somebody else's conflict, \"Read all versions\" writes out all three: their version, what is on the shared branch, and what both started from. If you decide what the file should say, edit it and press Publish now - their side takes your version when it arrives.\n\n"
+        "While anybody is resolving, the app stops publishing your work AUTOMATICALLY, so the ground does not move under them. Publish now and push-now.ps1 still send immediately: that is a decision, and decisions stay yours."
+    ),
+    'requests': (
+        "Requests received.\n\n"
+        "When somebody invites you to a shared project, GitHub holds that invitation for you, and it is listed here: who invited you, and to which repository.\n\n"
+        "Accept downloads the project and starts syncing. Decline tells GitHub no - the request disappears for both of you, nothing is downloaded, and they can invite you again later.\n\n"
+        "It sits on the top line beside Help, with the buttons that govern the whole project rather than today's work, and appears only while a project is open - you would otherwise never see an invitation while working. On the first screen the same news shows as a number on the Join button.\n\n"
+        "The button is grey while nothing is waiting. It checks about once a minute and lights up on its own, so there is nothing to refresh by hand."
     ),
     'open_existing': (
         "Open a project already on this machine.\n\n"
@@ -1121,9 +1492,10 @@ HELP = {
         "Nothing is deleted: the files on disk and the GitHub repository are untouched. Reconnect any time with \"Open a project\"."
     ),
     'partner': (
-        "Teammate light.\n\n"
-        "Says whether the other side is syncing right now.\n\n"
-        "Green means their engine is running and its heartbeat is fresh. Amber means they are offline, with how long ago they were last seen. Grey means they have never connected - most likely the GitHub invitation is still unaccepted.\n\n"
+        "Who is on this project.\n\n"
+        "Up to five people online are named outright, each with its own light: green is syncing right now, grey is away with how long ago they were last seen.\n\n"
+        "Past five, the names stop being readable at a glance and it shows the count instead. Hover it for up to ten of them, and click it for everybody.\n\n"
+        "When more than ten are online, the ten you are shown are the busiest: most work landed in the last three hours, then the last day, then the last week - each window filling only the places the one before could not.\n\n"
         "The heartbeat travels through the repository itself and adds no commits to your project history. It refreshes every 60 seconds, so up to a minute of lag is normal."
     ),
     'shortcut': (
@@ -1166,6 +1538,222 @@ class Pill(ttk.Frame):
         self.lbl.configure(text=latin(text), foreground=color)
 
 
+class TeamPanel(ttk.Frame):
+    """Who is here, in the corner where one partner light used to be.
+
+    Up to five people online are named outright, one under the next, each
+    with its own lamp - at that size a list IS the summary. Past five the
+    names stop being readable at a glance and a count is the honest thing to
+    show; the names are then a hover away and the whole team a click away.
+
+    The lamp is the plain circle U+25CF, not an emoji: the character takes
+    the foreground colour, while an emoji is drawn by the font in its own
+    colours and can never be green. (The project chooser needed painted
+    images for the same reason - it had tried an emoji.)
+    """
+
+    MAX_ROWS = 5          # named outright up to here
+    HOVER_MAX = 10        # shown in the hover list
+
+    def __init__(self, parent, on_click):
+        super().__init__(parent)
+        self.on_click = on_click
+        self.rows = []
+        self.people = []
+        self.activity = {}
+        self.summary = ttk.Label(self, text="", font=FONT_B, foreground=FG, cursor="hand2")
+        self.summary.bind("<Button-1>", lambda e: self.on_click())
+        self.summary.bind("<Enter>", self._hover_in)
+        self.summary.bind("<Leave>", self._hover_out)
+        self.popup = None
+        self._hide_job = None
+
+    # -- drawing ----------------------------------------------------------
+
+    def set(self, people, activity):
+        """people: [{name, ago, online}] already sorted online-first."""
+        self.people = list(people)
+        self.activity = dict(activity or {})
+        for widget in self.rows:
+            widget.destroy()
+        self.rows = []
+        self.summary.pack_forget()
+
+        online = [p for p in self.people if p["online"]]
+        if len(online) > self.MAX_ROWS:
+            self.summary.config(text=latin(f"{len(online)} people online"))
+            self.summary.pack(anchor="e")
+            return
+
+        if online:
+            for person in online:
+                self._row(person["name"], OK, "online")
+        elif self.people:
+            # Nobody here now. The most recently seen person, with when -
+            # which is the whole answer when a project has one other member,
+            # and the case this corner has always served.
+            newest = self.people[0]
+            self._row(newest["name"], WARN, seen_phrase(newest["ago"]))
+            if len(self.people) > 1:
+                self._more(f"+{len(self.people) - 1} more")
+        else:
+            self._row("nobody has joined yet", MUTED, "")
+
+        if online and len(self.people) > len(online):
+            self._more(f"+{len(self.people) - len(online)} offline")
+
+    def _row(self, name, colour, note):
+        row = ttk.Frame(self)
+        row.pack(anchor="e")
+        ttk.Label(row, text="●", foreground=colour,
+                  font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
+        text = latin(name) + (latin(f"  {note}") if note else "")
+        ttk.Label(row, text=text, font=FONT_B, foreground=colour).pack(side="left")
+        self.rows.append(row)
+
+    def _more(self, text):
+        row = ttk.Label(self, text=latin(text), font=("Segoe UI", 8),
+                        foreground=MUTED, cursor="hand2")
+        row.pack(anchor="e")
+        row.bind("<Button-1>", lambda e: self.on_click())
+        row.bind("<Enter>", self._hover_in)
+        row.bind("<Leave>", self._hover_out)
+        self.rows.append(row)
+
+    # -- who goes in the short list ---------------------------------------
+
+    def shortlist(self):
+        """The up-to-ten shown on hover.
+
+        Online first. If more than ten are online, the ten are the busiest -
+        by work landed in the last three hours, then the last day, then the
+        last week, each window filling only what the one before could not.
+        If fewer than ten are online, the rest are the people seen most
+        recently, so the list is never padded with strangers before it is
+        filled with the people who were just here.
+        """
+        online = [p for p in self.people if p["online"]]
+        offline = [p for p in self.people if not p["online"]]
+        if len(online) > self.HOVER_MAX:
+            order = rank_by_activity([p["name"] for p in online], self.activity)
+            by_name = {p["name"]: p for p in online}
+            chosen = [by_name[n] for n in order[:self.HOVER_MAX]]
+        else:
+            chosen = online + offline[:self.HOVER_MAX - len(online)]
+        return chosen[:self.HOVER_MAX]
+
+    # -- the hover list ----------------------------------------------------
+
+    def _hover_in(self, _event=None):
+        if self._hide_job:
+            self.after_cancel(self._hide_job)
+            self._hide_job = None
+        if self.popup is not None:
+            return
+        rows = self.shortlist()
+        if not rows:
+            return
+        pop = tk.Toplevel(self)
+        pop.overrideredirect(True)          # no title bar: it is a tooltip
+        pop.attributes("-topmost", True)
+        frame = ttk.Frame(pop, padding=(12, 8))
+        frame.pack(fill="both", expand=True)
+        try:
+            pop.configure(background=PANEL)
+        except tk.TclError:
+            pass
+        for person in rows:
+            line = ttk.Frame(frame)
+            line.pack(anchor="w")
+            colour = OK if person["online"] else MUTED
+            ttk.Label(line, text="●", foreground=colour,
+                      font=("Segoe UI", 10)).pack(side="left", padx=(0, 8))
+            note = "online" if person["online"] else seen_phrase(person["ago"])
+            ttk.Label(line, text=latin(f"{person['name']}  -  {note}"),
+                      font=FONT, foreground=FG).pack(side="left")
+        hidden = len(self.people) - len(rows)
+        if hidden > 0:
+            ttk.Label(frame, text=latin(f"+{hidden} more - click for everyone"),
+                      font=("Segoe UI", 8), foreground=MUTED).pack(anchor="w", pady=(6, 0))
+        # Entering the popup must not count as leaving the label, or moving
+        # the mouse onto it would close the thing it is moving onto.
+        pop.bind("<Enter>", self._hover_in)
+        pop.bind("<Leave>", self._hover_out)
+        pop.update_idletasks()
+        x = self.winfo_rootx() + self.winfo_width() - pop.winfo_width()
+        y = self.winfo_rooty() + self.winfo_height() + 4
+        pop.geometry(f"+{max(x, 0)}+{y}")
+        self.popup = pop
+
+    def _hover_out(self, _event=None):
+        # A short delay, because the pointer briefly belongs to neither
+        # widget while it crosses the gap between them.
+        if self._hide_job:
+            self.after_cancel(self._hide_job)
+        self._hide_job = self.after(220, self._hide_popup)
+
+    def _hide_popup(self):
+        self._hide_job = None
+        if self.popup is not None:
+            try:
+                self.popup.destroy()
+            except tk.TclError:
+                pass
+            self.popup = None
+
+
+class TeamWindow(tk.Toplevel):
+    """Everybody on the project, online first, then by when they were last here."""
+
+    def __init__(self, parent, people, activity):
+        super().__init__(parent)
+        self.title("Who is on this project")
+        self.transient(parent)
+        self.grab_set()
+        self.minsize(420, 260)
+
+        wrap = ttk.Frame(self, padding=(20, 16))
+        wrap.pack(fill="both", expand=True)
+        online = [p for p in people if p["online"]]
+        head = (f"{len(online)} online, {len(people) - len(online)} away"
+                if people else "Nobody has joined yet")
+        ttk.Label(wrap, text=head, font=FONT_H, foreground=FG).pack(anchor="w")
+        ttk.Label(wrap, text="Everyone who has ever connected to this project.",
+                  font=FONT, foreground=MUTED).pack(anchor="w", pady=(4, 12))
+
+        area = ScrollArea(wrap, height=220)
+        area.pack(fill="both", expand=True)
+        for person in people:
+            line = ttk.Frame(area.inner)
+            line.pack(fill="x", pady=2)
+            colour = OK if person["online"] else MUTED
+            ttk.Label(line, text="●", foreground=colour,
+                      font=("Segoe UI", 11)).pack(side="left", padx=(0, 10))
+            ttk.Label(line, text=latin(person["name"]), font=FONT_B,
+                      foreground=FG).pack(side="left")
+            note = "online" if person["online"] else seen_phrase(person["ago"])
+            ttk.Label(line, text=latin(note), font=("Segoe UI", 9),
+                      foreground=colour).pack(side="right")
+            counts = activity.get(person["name"])
+            if counts and counts[2]:
+                ttk.Label(line, text=latin(f"{counts[2]} this week"),
+                          font=("Segoe UI", 8), foreground=MUTED).pack(side="right", padx=(0, 14))
+
+        row = ttk.Frame(wrap)
+        row.pack(fill="x", pady=(14, 0))
+        button(row, "Close", self._close).pack(side="right")
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + 70
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _close(self):
+        self.grab_release()
+        self.destroy()
+
+
 def _shade(colour, factor):
     """Lighten (factor > 1) or darken (factor < 1) a #rrggbb colour."""
     colour = colour.lstrip("#")
@@ -1201,14 +1789,457 @@ def help_button(parent, key):
     return holder
 
 
+# ----------------------------------------------------- people and invitations ---
+#
+# Everything in this section answers one question the app used to ask the
+# person instead: who are you, who do you work with, and who has asked you to
+# join something. All three answers already exist - in the GitHub account the
+# machine is signed in to, in the repositories that account can see, and in
+# git's own settings on this disk. Asking a human to retype them was the
+# friction; reading them is the fix.
+#
+# The rule for the whole section: GitHub is the record, this is a cache of it.
+# A hand-kept list of teammates cannot know that somebody was removed from a
+# repository on github.com, and would go on offering them for years.
+
+
+def gh_json(*args):
+    """Run a gh command and parse its JSON output.
+
+    Parsed here rather than with `--jq` so that a failed call is None and an
+    empty result is [] - two different things that --jq would flatten into one
+    empty string, which reads as "nobody" when it means "could not ask".
+    """
+    out = gh(*args)
+    if out is None:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+def git_identity(cfg):
+    """The name and email git already commits under on this machine.
+
+    Looked for in a project this person already shares before falling back to
+    the global setting, because the project copy is what they actually chose
+    for shared work. Returns (name, email), either possibly empty.
+    """
+    seen = []
+    for entry in [{"path": cfg.get("last_project")}] + list(cfg.get("projects", [])):
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if not path or path in seen:
+            continue
+        seen.append(path)
+        if os.path.isdir(os.path.join(path, ".git")):
+            name = git(path, "config", "user.name")
+            mail = git(path, "config", "user.email")
+            if name or mail:
+                return name, mail
+    return (git(None, "config", "--global", "user.name"),
+            git(None, "config", "--global", "user.email"))
+
+
+def detect_identity(cfg):
+    """Fill in who this person is, so no form ever asks them twice.
+
+    GitHub is asked only for the username - the one fact only it knows. The
+    name and email come from git on this machine. GitHub's own email address
+    is deliberately NOT requested: reading it needs a wider token scope than
+    this app has any business holding, and the answer is already on the disk.
+    When the account has never committed anywhere, the address falls back to
+    GitHub's own noreply form, which is always valid and never leaks a real
+    inbox.
+
+    Returns the identity dict and writes it into cfg. Network-bound - call it
+    off the main thread.
+    """
+    login = gh("api", "user", "--jq", ".login") or cfg.get("my_login", "")
+    name, mail = git_identity(cfg)
+    ident = {
+        "my_login": login,
+        "me": cfg.get("me") or name or login,
+        "email": cfg.get("email") or mail or (f"{login}@users.noreply.github.com" if login else ""),
+    }
+    cfg.update({k: v for k, v in ident.items() if v})
+    return ident
+
+
+def _repo_people(slug, me):
+    """Everyone attached to one repository, as (login, pending) pairs.
+
+    Three kinds of person show up here: the owner of a repository somebody
+    shared with ME, the collaborators on one I own, and the people I have
+    invited who have not accepted yet. The last group matters - they are the
+    ones most likely to be invited again by mistake.
+    """
+    found = []
+    owner = slug.split("/")[0]
+    if owner and owner.lower() != (me or "").lower():
+        found.append((owner, False))
+    people = gh_json("api", f"repos/{slug}/collaborators", "--paginate")
+    for who in people or []:
+        login = (who or {}).get("login", "")
+        if login and login.lower() != (me or "").lower():
+            found.append((login, False))
+    # Only an admin may read this one; on a repository we merely joined it
+    # answers 403, which gh_json turns into None and this loop skips.
+    invites = gh_json("api", f"repos/{slug}/invitations")
+    for inv in invites or []:
+        login = ((inv or {}).get("invitee") or {}).get("login", "")
+        if login:
+            found.append((login, True))
+    return found
+
+
+def _hidden_set(cfg):
+    return {s.lower() for s in cfg.get("people_hidden", []) if s}
+
+
+def refresh_people(cfg):
+    """Keep the history of everyone this person has ever shared a project with.
+
+    The list is a HISTORY, not a census. Sharing with somebody once puts them
+    in it and they stay: the question this list answers is "who might I share
+    with next", and a project that ended does not make a person a stranger.
+    So GitHub is used to DISCOVER people - it finds the teammate on a
+    repository the app never set up - but it is not the authority on who
+    stays. Nothing here removes anybody.
+
+    The one way out is the person saying so, which puts a name in
+    `people_hidden` and is honoured here for good. Network-bound - call it off
+    the main thread.
+    """
+    me = cfg.get("my_login", "")
+    hidden = _hidden_set(cfg)
+    by_login = {}
+    for entry in cfg.get("people", []):
+        login = entry.get("login", "")
+        if login and login.lower() not in hidden:
+            by_login[login.lower()] = dict(entry)
+
+    for entry in cfg.get("projects", []):
+        slug = repo_slug(entry.get("path", ""))
+        if not slug:
+            continue
+        for login, pending in _repo_people(slug, me):
+            if login.lower() in hidden:
+                continue
+            rec = by_login.setdefault(login.lower(), {"login": login, "name": ""})
+            rec["login"] = login
+            rec["pending"] = pending
+            shared = rec.setdefault("projects", [])
+            short = slug.split("/")[-1]
+            if short not in shared:
+                shared.append(short)
+
+    people = sorted(by_login.values(), key=lambda r: r.get("login", "").lower())
+    cfg["people"] = people
+    return people
+
+
+def remember_person(cfg, login, name=""):
+    """Record somebody the moment they are invited, before GitHub is asked again.
+
+    Without this the roster would stay empty until the next refresh, so the
+    very person just invited would be missing from the list on the next
+    screen - the one place they are most likely to be wanted.
+
+    Inviting somebody who was removed from the list puts them back. Choosing
+    them again is a plainer statement of intent than the removal was.
+    """
+    login = (login or "").strip()
+    if not login:
+        return
+    cfg["people_hidden"] = [s for s in cfg.get("people_hidden", [])
+                            if s.lower() != login.lower()]
+    for rec in cfg.setdefault("people", []):
+        if rec.get("login", "").lower() == login.lower():
+            if name and not rec.get("name"):
+                rec["name"] = name
+            return
+    cfg["people"].append({"login": login, "name": name, "projects": [], "pending": True})
+
+
+def forget_person(cfg, login):
+    """Take somebody out of the list of people to offer next time.
+
+    Local only, and worth being exact about: it does not remove them from any
+    repository, does not end any sharing, and does not tell them anything. It
+    only stops this app suggesting them. Remembered as a name to skip rather
+    than by deletion, because the next refresh would otherwise rediscover
+    them from GitHub and put them straight back.
+    """
+    login = (login or "").strip()
+    if not login:
+        return
+    cfg["people"] = [r for r in cfg.get("people", [])
+                     if r.get("login", "").lower() != login.lower()]
+    hidden = cfg.setdefault("people_hidden", [])
+    if login.lower() not in {s.lower() for s in hidden}:
+        hidden.append(login)
+
+
+_invite_etag = {"etag": None, "value": []}
+
+
+def _invitations_raw():
+    """The raw invitation list, asked for as cheaply as the answer allows.
+
+    Asked again every minute so the button un-greys on its own, so the cost of
+    asking matters. A conditional request answers 304 when nothing has
+    changed, which is fast and does not count against the rate limit at all -
+    the same trick the release check uses. When there is no HTTP client (no
+    token readable), it falls back to gh, which is correct but not free.
+    """
+    opener = _release_client()
+    if opener is None:
+        return gh_json("api", "/user/repository_invitations")
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request("https://api.github.com/user/repository_invitations")
+    if _invite_etag["etag"]:
+        req.add_header("If-None-Match", _invite_etag["etag"])
+    try:
+        with opener.open(req, timeout=15) as res:
+            _invite_etag["etag"] = res.headers.get("ETag")
+            _invite_etag["value"] = json.loads(res.read().decode("utf-8", "replace"))
+            return _invite_etag["value"]
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return _invite_etag["value"]        # unchanged since last look
+        return None
+    except Exception:
+        return None
+
+
+def pending_invitations():
+    """Invitations waiting for this account on GitHub.
+
+    This is what closes the app's oldest piece of friction: joining used to
+    require going to github.com, finding the invitation and accepting it by
+    hand, because init-friend fails with "repository not found" against a
+    repository the account cannot see yet. The invitation was always readable
+    through the API; nothing was ever shown.
+    """
+    data = _invitations_raw()
+    out = []
+    for inv in data or []:
+        repo = (inv or {}).get("repository") or {}
+        full = repo.get("full_name", "")
+        if not full or "/" not in full:
+            continue
+        owner, name = full.split("/", 1)
+        out.append({
+            "id": inv.get("id"),
+            "owner": owner,
+            "name": name,
+            "full": full,
+            "inviter": ((inv.get("inviter") or {}).get("login") or owner),
+            "private": bool(repo.get("private")),
+        })
+    return out
+
+
+def _answer_invitation(invitation_id, method):
+    """Accept (PATCH) or decline (DELETE) one invitation. True if GitHub took it.
+
+    Both answers are 204 No Content, so success arrives as an EMPTY string,
+    not a missing one - the check must be `is not None`, or every success
+    would be read as a failure. The cached list is dropped either way: the
+    invitation just answered is gone, and a 304 on the next look would
+    otherwise keep serving it.
+    """
+    ok = gh("api", "-X", method, f"/user/repository_invitations/{invitation_id}") is not None
+    if ok:
+        _invite_etag["etag"] = None
+        _invite_etag["value"] = []
+    return ok
+
+
+def accept_invitation(invitation_id):
+    """Take the invitation: this account becomes a collaborator."""
+    return _answer_invitation(invitation_id, "PATCH")
+
+
+def decline_invitation(invitation_id):
+    """Refuse the invitation. It disappears for both sides; the person who
+    sent it can send another. Nothing is downloaded and no access is gained."""
+    return _answer_invitation(invitation_id, "DELETE")
+
+
 # ------------------------------------------------------------- setup forms ---
 
-class SetupDialog(tk.Toplevel):
-    """Collects what init-owner.ps1 / init-friend.ps1 need."""
+class ScrollArea(ttk.Frame):
+    """A frame whose contents scroll when there are more than fit.
 
-    def __init__(self, parent, mode, cfg):
+    Put rows inside `.inner`. The scrollbar appears only when it is needed,
+    because a permanent one beside three names is a claim that something is
+    hidden when nothing is.
+    """
+
+    def __init__(self, parent, height):
+        super().__init__(parent)
+        self.canvas = tk.Canvas(self, height=height, highlightthickness=0,
+                                background=BG, borderwidth=0)
+        self.bar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self._on_scroll)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.inner = ttk.Frame(self.canvas)
+        self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        # The inner frame decides the scrollable height; the canvas decides the
+        # width. Without the second binding the rows keep their natural width
+        # and every label is cut off at the first long username.
+        self.inner.bind("<Configure>",
+                        lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>",
+                         lambda e: self.canvas.itemconfigure(self._window, width=e.width))
+        self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._wheel))
+        self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
+
+    def _on_scroll(self, first, last):
+        # Shown only while something is out of sight.
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self.bar.pack_forget()
+        else:
+            self.bar.pack(side="right", fill="y")
+        self.bar.set(first, last)
+
+    def _wheel(self, event):
+        self.canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+
+class PeoplePicker(ttk.Frame):
+    """Choose who to share with: the people already worked with, or a new name.
+
+    Built as a list of tick boxes rather than a box to type in, because the
+    name needed is a GitHub username - exact, easy to mistype, and already
+    known to the app for everybody this person has shared with before.
+
+    A real Checkbutton rather than a selected row or a drawn square: only the
+    real widget shows at a glance which names are ticked when the list is
+    longer than the eye, keeps its tick while the mouse goes elsewhere, and
+    answers to the keyboard. The same reason the buttons in this app are
+    themed widgets and not canvas drawings.
+
+    Any number can be ticked. Nothing downstream depends on there being
+    exactly one: the invitation loop takes as many as it is given, which is
+    the first piece of the app that no longer assumes two people.
+    """
+
+    def __init__(self, parent, cfg, on_change=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.on_change = on_change
+        self.ticks = {}
+
+        self.head = ttk.Label(self, text="People you have shared with before",
+                              font=FONT_B, foreground=FG)
+        self.hint = ttk.Label(self, text="Tick everyone this project is for.",
+                              font=("Segoe UI", 8), foreground=MUTED)
+        self.area = ScrollArea(self, height=150)
+
+        self.typed_label = ttk.Label(self, text="", font=FONT_B, foreground=FG)
+        self.typed = tk.StringVar(value="")
+        self.entry = ttk.Entry(self, textvariable=self.typed, font=FONT)
+        self.foot = ttk.Label(self, text="Separate several with a comma. "
+                                         "Leave empty to invite nobody for now.",
+                              font=("Segoe UI", 8), foreground=MUTED)
+        self._render()
+
+    def _render(self):
+        """Draw the list from the config, so a removal can simply redraw."""
+        for widget in (self.head, self.hint, self.area, self.typed_label,
+                       self.entry, self.foot):
+            widget.pack_forget()
+        for child in self.area.inner.winfo_children():
+            child.destroy()
+
+        people = [r for r in self.cfg.get("people", []) if r.get("login")]
+        # A ticked box must survive a redraw: removing one person is not a
+        # reason to un-tick everybody else.
+        keep = {login: var.get() for login, var in self.ticks.items()}
+        self.ticks = {}
+
+        if people:
+            self.head.pack(anchor="w", pady=(8, 2))
+            self.hint.pack(anchor="w", pady=(0, 6))
+            self.area.configure(height=min(len(people), 5) * 30)
+            self.area.canvas.configure(height=min(len(people), 5) * 30)
+            self.area.pack(fill="x")
+            for rec in people:
+                self._row(rec, keep)
+
+        self.typed_label.config(text="Or a GitHub username" if people
+                                else "Their GitHub username")
+        self.typed_label.pack(anchor="w", pady=(10, 2))
+        self.entry.pack(anchor="w", fill="x", ipady=6)
+        self.foot.pack(anchor="w")
+
+    def _row(self, rec, keep):
+        login = rec["login"]
+        var = tk.BooleanVar(value=keep.get(login, False))
+        self.ticks[login] = var
+        row = ttk.Frame(self.area.inner)
+        row.pack(fill="x", pady=1)
+        name = rec.get("name") or login
+        # The username is the part that must be right, so it is shown even
+        # when a friendlier name exists - never instead of it.
+        caption = name if name == login else f"{name}  ({login})"
+        ttk.Checkbutton(row, text=caption, variable=var).pack(side="left")
+        ttk.Button(row, text="x", width=2, style="Small.TButton",
+                   command=lambda l=login: self._forget(l)).pack(side="right", padx=(8, 2))
+        where = ", ".join(rec.get("projects", []) or [])
+        if rec.get("pending"):
+            where = (where + " - invitation not accepted yet").strip(" -")
+        if where:
+            ttk.Label(row, text=where, font=("Segoe UI", 8),
+                      foreground=MUTED).pack(side="right", padx=(8, 4))
+
+    def _forget(self, login):
+        if not messagebox.askyesno(
+                APP_NAME,
+                "Remove " + login + " from the list of people to offer next time?" + NN +
+                "This only changes this list on this machine. It does not remove "
+                "them from any project, does not stop any sharing that is already "
+                "running, and tells them nothing." + NN +
+                "Inviting them again puts them back.",
+                parent=self.winfo_toplevel()):
+            return
+        forget_person(self.cfg, login)
+        save_config(self.cfg)
+        self._render()
+        if self.on_change:
+            self.on_change()
+
+    def chosen(self):
+        """Every username ticked or typed, de-duplicated, order kept."""
+        names = [login for login, var in self.ticks.items() if var.get()]
+        for chunk in self.typed.get().replace(";", ",").split(","):
+            chunk = chunk.strip().lstrip("@")
+            if chunk:
+                names.append(chunk)
+        out = []
+        for n in names:
+            if n.lower() not in [o.lower() for o in out]:
+                out.append(n)
+        return out
+
+
+class SetupDialog(tk.Toplevel):
+    """Collects what init-owner.ps1 / init-friend.ps1 need.
+
+    In join mode it can be handed an invitation, in which case the two facts
+    that used to be typed from a chat message - whose account, which
+    repository - are filled in and shown as settled, and the only question
+    left is where to put the folder.
+    """
+
+    def __init__(self, parent, mode, cfg, invite=None):
         super().__init__(parent)
         self.mode = mode
+        self.invite = invite
         self.result = None
         self.title("Start a new shared project" if mode == "owner" else "Join a project")
         self.resizable(False, False)
@@ -1222,37 +2253,64 @@ class SetupDialog(tk.Toplevel):
                else "Connect to a project someone shared with you"
         ttk.Label(wrap, text=head, font=FONT_H, foreground=FG).pack(anchor="w")
 
-        note = ("Everything in the folder, including sub-folders, is uploaded to a\n"
-                "new PRIVATE repository on your GitHub account."
-                if mode == "owner" else
-                "Accept the GitHub invitation first, otherwise this fails with\n"
-                "\"repository not found\" - which is not a typo on your side.")
+        if mode == "owner":
+            note = ("Everything in the folder, including sub-folders, is uploaded to a\n"
+                    "new PRIVATE repository on your GitHub account. Only the people\n"
+                    "you invite here can see it.")
+        elif invite:
+            note = (f"{invite['inviter']} invited you to {invite['full']}.\n"
+                    "Choosing a folder accepts the invitation and downloads the project.")
+        else:
+            note = ("Accept the GitHub invitation first, otherwise this fails with\n"
+                    "\"repository not found\" - which is not a typo on your side.")
         ttk.Label(wrap, text=note, font=FONT, foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 14))
 
         self.vars = {}
+        self.picker = None
         if mode == "owner":
             self._folder_row(wrap, "path", "Project folder", pick_existing=True)
             self._row(wrap, "reponame", "Repository name", "",
                       "Lower-case latin only. Leave empty to use the folder name.")
-            self._row(wrap, "friend", "Their GitHub username", cfg.get("friend", ""))
+            self.picker = PeoplePicker(wrap, cfg)
+            self.picker.pack(fill="x")
+        elif invite:
+            self._fixed_row(wrap, "reponame", "Repository", invite["name"])
+            self._fixed_row(wrap, "owner", "Shared by", invite["owner"])
+            self._folder_row(wrap, "path", "Download into (any empty folder you like)",
+                             pick_existing=False)
         else:
             self._row(wrap, "reponame", "Repository name", "", "The name they gave you.")
-            self._row(wrap, "owner", "Their GitHub username", cfg.get("owner", "aminbm1919"))
+            self._row(wrap, "owner", "Their GitHub username", cfg.get("owner", ""))
             self._folder_row(wrap, "path", "Download into (any empty folder you like)",
                              pick_existing=False)
 
+        # Identity is detected once and reused. It is still shown, because a
+        # person is entitled to see what will be written into their commits,
+        # and still editable, because a detected answer can be the wrong one.
         self._row(wrap, "me", "Your name", cfg.get("me", ""), "Shown as the author of your commits.")
         self._row(wrap, "email", "Your GitHub email", cfg.get("email", ""))
 
         row = ttk.Frame(wrap)
         row.pack(fill="x", pady=(16, 0))
         button(row, "Cancel", self.destroy).pack(side="right")
-        button(row, "Start" if mode == "owner" else "Connect", self._ok, primary=True).pack(side="right", padx=(0, 8))
+        ok = "Start" if mode == "owner" else ("Accept and download" if invite else "Connect")
+        button(row, ok, self._ok, primary=True).pack(side="right", padx=(0, 8))
 
         self.update_idletasks()
         x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
         y = parent.winfo_rooty() + 70
         self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _fixed_row(self, parent, key, label, value):
+        """A fact that came from GitHub, shown but not up for editing.
+
+        An entry the person could change would invite them to change it, and
+        any change would point the download at a repository the invitation
+        does not cover.
+        """
+        ttk.Label(parent, text=label, font=FONT_B, foreground=FG).pack(anchor="w", pady=(8, 2))
+        ttk.Label(parent, text=value, font=FONT, foreground=ACCENT).pack(anchor="w")
+        self.vars[key] = tk.StringVar(value=value)
 
     def _row(self, parent, key, label, default="", hint=""):
         ttk.Label(parent, text=label, font=FONT_B, foreground=FG).pack(anchor="w", pady=(8, 2))
@@ -1285,8 +2343,497 @@ class SetupDialog(tk.Toplevel):
         if self.mode == "friend" and not vals.get("reponame"):
             messagebox.showwarning(APP_NAME, "Enter the repository name they gave you.", parent=self)
             return
+        if self.picker:
+            vals["people"] = self.picker.chosen()
+            # The engine takes one comma-separated string, never a list: with
+            # powershell.exe -File a list would bind its second name to the
+            # next parameter instead. Measured, not assumed.
+            vals["friend"] = ",".join(vals["people"])
         self.result = vals
         self.destroy()
+
+
+class RequestsWindow(tk.Toplevel):
+    """The invitations waiting for this account, each answerable here.
+
+    Accept and Decline sit on the same row on purpose: an invitation is a
+    question, and a window that offers only "yes" makes the person go to
+    github.com to say no - which is the errand this whole screen exists to
+    abolish.
+
+    The list refreshes itself while the window is open, so an invitation that
+    arrives, or one answered on the other machine, does not leave a stale row
+    to press.
+    """
+
+    def __init__(self, parent, app, on_join):
+        super().__init__(parent)
+        self.app = app
+        self.on_join = on_join
+        self.title("Requests received")
+        self.transient(parent)
+        self.grab_set()
+        self.minsize(560, 240)
+
+        wrap = ttk.Frame(self, padding=(20, 16))
+        wrap.pack(fill="both", expand=True)
+        ttk.Label(wrap, text="People asking you to join their project",
+                  font=FONT_H, foreground=FG).pack(anchor="w")
+        ttk.Label(wrap, text="Accepting downloads the project. Declining tells GitHub no; "
+                             "they can invite you again later.",
+                  font=FONT, foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 12))
+
+        self.area = ScrollArea(wrap, height=190)
+        self.area.pack(fill="both", expand=True)
+        self.empty = ttk.Label(wrap, text="", font=FONT, foreground=MUTED)
+
+        row = ttk.Frame(wrap)
+        row.pack(fill="x", pady=(14, 0))
+        button(row, "Close", self._close).pack(side="right")
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.app.watch_invitations(self.render)
+        self.render(self.app.invitations())
+
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + 60
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _close(self):
+        self.app.unwatch_invitations(self.render)
+        self.grab_release()
+        self.destroy()
+
+    def render(self, invites):
+        for child in self.area.inner.winfo_children():
+            child.destroy()
+        if not invites:
+            self.empty.config(text="Nothing is waiting. This window updates by itself.")
+            self.empty.pack(anchor="w", pady=(10, 0))
+            return
+        self.empty.pack_forget()
+        for inv in invites:
+            row = ttk.Frame(self.area.inner, padding=(0, 6))
+            row.pack(fill="x")
+            text = ttk.Frame(row)
+            text.pack(side="left", fill="x", expand=True)
+            ttk.Label(text, text=inv["full"], font=FONT_B, foreground=FG).pack(anchor="w")
+            ttk.Label(text, text=f"invited by {inv['inviter']}"
+                                 + ("  -  private" if inv.get("private") else ""),
+                      font=("Segoe UI", 8), foreground=MUTED).pack(anchor="w")
+            button(row, "Decline", lambda i=inv: self._decline(i), danger=True).pack(side="right")
+            button(row, "Accept", lambda i=inv: self._accept(i),
+                   primary=True).pack(side="right", padx=(0, 8))
+
+    def _accept(self, inv):
+        # The window closes first: accepting opens the folder-choosing dialog,
+        # and this one holds a grab that would keep that dialog unusable.
+        self._close()
+        self.on_join(inv)
+
+    def _decline(self, inv):
+        if not messagebox.askyesno(
+                APP_NAME,
+                "Decline the invitation to " + inv["full"] + "?" + NN +
+                inv["inviter"] + " will be able to invite you again, but this "
+                "request disappears for both of you.", parent=self):
+            return
+        if decline_invitation(inv["id"]):
+            self.app.lines.put("declined the invitation to " + inv["full"])
+            self.app.drop_invitation(inv["id"])
+        else:
+            messagebox.showwarning(
+                APP_NAME,
+                "GitHub would not take that. The invitation may already have "
+                "been withdrawn, or answered on another machine.", parent=self)
+            self.app.refresh_invitations()
+
+
+class JoinChooser(tk.Toplevel):
+    """The two ways in: answer a request, or type the details by hand.
+
+    The second exists because the first depends on GitHub answering and on
+    both people being signed in to the accounts they think they are. When
+    that goes wrong the person must still be able to join, so the manual door
+    is kept and named as what it is.
+    """
+
+    def __init__(self, parent, app, on_requests, on_manual):
+        super().__init__(parent)
+        self.app = app
+        self.title("Join a project")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        wrap = ttk.Frame(self, padding=(22, 18))
+        wrap.pack(fill="both", expand=True)
+        ttk.Label(wrap, text="Join a project someone shared with you",
+                  font=FONT_H, foreground=FG).pack(anchor="w")
+        ttk.Label(wrap, text="If they have invited you, their request is waiting below.",
+                  font=FONT, foreground=MUTED).pack(anchor="w", pady=(4, 16))
+
+        self.req_btn = button(wrap, "Requests received", lambda: self._go(on_requests),
+                              primary=True)
+        self.req_btn.pack(anchor="w", fill="x")
+        self.req_hint = ttk.Label(wrap, text="", font=("Segoe UI", 8), foreground=MUTED)
+        self.req_hint.pack(anchor="w", pady=(2, 14))
+
+        button(wrap, "Enter the details by hand", lambda: self._go(on_manual)).pack(anchor="w", fill="x")
+        ttk.Label(wrap, text="For when no request shows up and you know the repository name.",
+                  font=("Segoe UI", 8), foreground=MUTED).pack(anchor="w", pady=(2, 0))
+
+        ttk.Frame(wrap, height=8).pack()
+        button(wrap, "Cancel", self._close).pack(anchor="e")
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.app.watch_invitations(self.refresh)
+        self.refresh(self.app.invitations())
+
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + 80
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def refresh(self, invites):
+        set_request_button(self.req_btn, invites)
+        self.req_hint.config(
+            text="Nothing waiting yet - this updates by itself." if not invites
+            else "Accept or decline each one.")
+
+    def _close(self):
+        self.app.unwatch_invitations(self.refresh)
+        self.grab_release()
+        self.destroy()
+
+    def _go(self, action):
+        self._close()
+        action()
+
+
+def set_request_button(btn, invites):
+    """One rule for every 'Requests received' button, wherever it stands.
+
+    Greyed while nothing is waiting, because a button that opens an empty
+    list teaches the person to stop pressing it. The count is in the label so
+    the answer is known before the window opens.
+    """
+    count = len(invites or [])
+    if count:
+        btn.config(text=f"Requests received ({count})")
+        btn.state(["!disabled"])
+    else:
+        btn.config(text="Requests received")
+        btn.state(["disabled"])
+
+
+JOIN_LABEL = "Join a project someone shared with me"
+
+
+def set_join_button(btn, invites):
+    """The count on the join button, which never greys.
+
+    Unlike the requests button, this one always works: the manual way in
+    lives behind it, and that is exactly what somebody needs on the day no
+    invitation shows up. So the number appears and disappears; the button
+    does not.
+    """
+    count = len(invites or [])
+    btn.config(text=f"{JOIN_LABEL} ({count})" if count else JOIN_LABEL)
+
+
+def repo_admin(slug):
+    """Can this account invite people to that repository?
+
+    Asked before the button is offered rather than after it is pressed: a
+    button that always fails for half the team is worse than no button.
+    Returns True, False, or None when GitHub could not be asked at all.
+    """
+    data = gh_json("api", f"repos/{slug}")
+    if data is None:
+        return None
+    return bool((data.get("permissions") or {}).get("admin"))
+
+
+def invite_to_repo(slug, login):
+    """Invite one person to an existing project. (ok, message)."""
+    out = gh("api", "-X", "PUT", f"repos/{slug}/collaborators/{login}",
+             "-f", "permission=push")
+    if out is None:
+        return False, f"GitHub would not add {login}. Check the username."
+    return True, f"invited {login}"
+
+
+class AddPeopleWindow(tk.Toplevel):
+    """Invite more people to a project that is already running.
+
+    The app could only ever invite at creation time, so growing a team meant
+    going to github.com and knowing which settings page to find. The roster
+    and its tick boxes are the same ones the share form uses - one way to
+    choose a person, wherever you are choosing them.
+    """
+
+    def __init__(self, parent, app_window):
+        super().__init__(parent)
+        self.app = app_window
+        self.slug = repo_slug(app_window.repo)
+        self.title("Add people to this project")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        wrap = ttk.Frame(self, padding=(22, 18))
+        wrap.pack(fill="both", expand=True)
+        ttk.Label(wrap, text="Add people to this project", font=FONT_H,
+                  foreground=FG).pack(anchor="w")
+        ttk.Label(wrap, text=latin(self.slug or "(no GitHub remote)"),
+                  font=FONT, foreground=ACCENT).pack(anchor="w", pady=(2, 10))
+
+        self.note = ttk.Label(wrap, text="", font=FONT, foreground=MUTED, justify="left")
+        self.note.pack(anchor="w", pady=(0, 8))
+
+        self.picker = PeoplePicker(wrap, app_window.cfg)
+        self.picker.pack(fill="x")
+
+        row = ttk.Frame(wrap)
+        row.pack(fill="x", pady=(16, 0))
+        button(row, "Close", self._close).pack(side="right")
+        self.btn = button(row, "Invite", self._invite, primary=True)
+        self.btn.pack(side="right", padx=(0, 8))
+        self.btn.state(["disabled"])
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + 60
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        # Asking GitHub takes a moment; do it off the main thread and let the
+        # window appear first.
+        threading.Thread(target=self._check_rights, daemon=True).start()
+
+    def _check_rights(self):
+        allowed = repo_admin(self.slug) if self.slug else False
+        self.after(0, lambda: self._rights_known(allowed))
+
+    def _rights_known(self, allowed):
+        try:
+            if allowed:
+                self.note.config(
+                    text="They get a GitHub invitation, and it appears under\n"
+                         "\"Requests received\" in their own TeamSync.",
+                    foreground=MUTED)
+                self.btn.state(["!disabled"])
+            elif allowed is None:
+                self.note.config(
+                    text="GitHub could not be reached, so it is not certain you may\n"
+                         "invite people here. Check the connection and reopen this.",
+                    foreground=WARN)
+            else:
+                self.note.config(
+                    text="Only the person who created this project can invite others.\n"
+                         "Ask them to add anybody new.",
+                    foreground=WARN)
+        except tk.TclError:
+            pass                      # the window was closed while we asked
+
+    def _close(self):
+        self.grab_release()
+        self.destroy()
+
+    def _invite(self):
+        chosen = self.picker.chosen()
+        if not chosen:
+            messagebox.showinfo(APP_NAME, "Tick somebody, or type a GitHub username.",
+                                parent=self)
+            return
+        if not messagebox.askyesno(
+                APP_NAME,
+                "Invite these people to " + self.slug + "?" + NN +
+                "\n".join("  " + c for c in chosen) + NN +
+                "They will be able to read and change everything in this project.",
+                parent=self):
+            return
+        self.btn.state(["disabled"])
+        threading.Thread(target=lambda: self._send(chosen), daemon=True).start()
+
+    def _send(self, chosen):
+        done, failed = [], []
+        for login in chosen:
+            ok, message = invite_to_repo(self.slug, login)
+            (done if ok else failed).append(login)
+            self.app.lines.put(message)
+            if ok:
+                remember_person(self.app.cfg, login)
+        self.after(0, lambda: self._sent(done, failed))
+
+    def _sent(self, done, failed):
+        save_config(self.app.cfg)
+        if done:
+            self.app.lines.put(
+                "invited: " + ", ".join(done) +
+                " - it shows under Requests received in their TeamSync")
+        if failed:
+            messagebox.showwarning(
+                APP_NAME,
+                "GitHub would not add:" + NN + "\n".join("  " + f for f in failed) + NN +
+                "Usually a mistyped username. The others went out.", parent=self)
+        try:
+            self.btn.state(["!disabled"])
+            if done and not failed:
+                self._close()
+        except tk.TclError:
+            pass
+
+
+class ConflictReportsWindow(tk.Toplevel):
+    """Every conflict on the team right now, readable by anybody.
+
+    The point is the second half of the owner's rule: a conflict belongs to
+    one machine, but nobody should have to wait in the dark for it. Anyone
+    can read what is stuck, see all three versions, and - if they want -
+    write the final text and publish it. The stuck side takes that version
+    when it arrives.
+    """
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.title("Conflicts on this project")
+        self.transient(parent)
+        self.grab_set()
+        self.minsize(640, 300)
+
+        wrap = ttk.Frame(self, padding=(20, 16))
+        wrap.pack(fill="both", expand=True)
+        ttk.Label(wrap, text="Conflicts being resolved right now",
+                  font=FONT_H, foreground=FG).pack(anchor="w")
+        ttk.Label(wrap, text="A conflict happens on one machine, and only that machine can finish "
+                             "its merge.\nYou can still read every version, and publish the final "
+                             "text yourself if you get there first.",
+                  font=FONT, foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 12))
+
+        self.area = ScrollArea(wrap, height=200)
+        self.area.pack(fill="both", expand=True)
+        self.empty = ttk.Label(wrap, text="", font=FONT, foreground=MUTED)
+
+        row = ttk.Frame(wrap)
+        row.pack(fill="x", pady=(14, 0))
+        button(row, "Close", self._close).pack(side="right")
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.render()
+
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + 60
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _close(self):
+        self.grab_release()
+        self.destroy()
+
+    def render(self):
+        for child in self.area.inner.winfo_children():
+            child.destroy()
+        repo = self.app.repo
+        rows, me, claimed = [], "", {}
+        if repo:
+            me = presence_name(repo)
+            git(repo, "fetch", "-q", "--prune", "origin",
+                "+refs/teamsync/volunteer/*:refs/teamsync/volunteer/*")
+            claimed = conflict_volunteers(repo)
+            for who, files in team_conflicts(repo, me).items():
+                for path in files:
+                    rows.append((who, path, False))
+            # Our own, named as ours, so one window answers "what is stuck"
+            # rather than only "what is stuck for other people".
+            for path in (git(repo, "diff", "--name-only", "--diff-filter=U") or "").splitlines():
+                if path.strip():
+                    rows.append((me, path.strip(), True))
+        if not rows:
+            self.empty.config(text="Nothing is in conflict. This is the quiet answer.")
+            self.empty.pack(anchor="w", pady=(10, 0))
+            return
+        self.empty.pack_forget()
+        for who, path, is_mine in rows:
+            line = ttk.Frame(self.area.inner, padding=(0, 6))
+            line.pack(fill="x")
+
+            volunteer = claimed.get((who, path), "")
+            # The stuck person can always work on their own conflict - it is
+            # their rebase, and nobody else can finish it for them. Beyond
+            # that, exactly one other person may claim it: two people settling
+            # the same file separately is not help, it is the next conflict.
+            mine_to_take = is_mine or not volunteer or volunteer == me
+            if not is_mine:
+                var = tk.BooleanVar(value=(volunteer == me))
+                box = ttk.Checkbutton(
+                    line, text="", variable=var,
+                    command=lambda w=who, p=path, v=var: self._claim(w, p, v))
+                box.pack(side="left", padx=(0, 8))
+                if volunteer and volunteer != me:
+                    box.state(["disabled"])
+            else:
+                ttk.Label(line, text="   ").pack(side="left", padx=(0, 8))
+
+            text = ttk.Frame(line)
+            text.pack(side="left", fill="x", expand=True)
+            ttk.Label(text, text=latin(path), font=FONT_B, foreground=FG).pack(anchor="w")
+            if is_mine:
+                note, colour = "yours to finish - nobody else can", WARN
+            elif volunteer == me:
+                note, colour = f"stuck for {who} - you volunteered to settle it", OK
+            elif volunteer:
+                note, colour = f"stuck for {who} - {volunteer} is settling it", MUTED
+            else:
+                note, colour = f"stuck for {who} - tick the box to volunteer", MUTED
+            ttk.Label(text, text=latin(note), font=("Segoe UI", 8),
+                      foreground=colour).pack(anchor="w")
+
+            if is_mine:
+                button(line, "Open my copies", self.app._open_conflict).pack(side="right")
+            elif mine_to_take:
+                button(line, "Read all versions",
+                       lambda w=who, p=path: self._open_report(w, p)).pack(side="right")
+
+    def _claim(self, who, path, var):
+        """Take the job, or hand it back."""
+        repo = self.app.repo
+        me = presence_name(repo)
+        wanted = bool(var.get())
+        if not set_volunteer(repo, who, path, me, wanted):
+            var.set(not wanted)
+            messagebox.showwarning(
+                APP_NAME,
+                "That did not reach GitHub." + NN +
+                "Check the connection and try again - until it lands, nobody "
+                "else can see that you have taken it.", parent=self)
+            return
+        self.app.lines.put(
+            (f"you volunteered to settle {who}'s conflict in {path}" if wanted
+             else f"you handed {who}'s conflict in {path} back"))
+        self.render()
+
+    def _open_report(self, who, path):
+        repo = self.app.repo
+        folder = os.path.join(repo, "_conflicts", f"{who}-report")
+        try:
+            written = write_conflict_report(repo, who, path, folder)
+        except OSError as exc:
+            messagebox.showwarning(APP_NAME, f"Could not write the report: {exc}", parent=self)
+            return
+        if all(v is None for k, v in conflict_report(repo, who, path).items()):
+            messagebox.showinfo(
+                APP_NAME,
+                "Their side has not reached GitHub yet." + NN +
+                "The engine publishes it within about fifteen seconds of a conflict "
+                "starting. Try again in a moment.", parent=self)
+            return
+        self.app.lines.put(f"wrote {who}'s conflict report to _conflicts/{who}-report")
+        try:
+            os.startfile(folder)                      # noqa: S606 - a folder, by design
+        except OSError:
+            messagebox.showinfo(APP_NAME, "The report is in:" + NN + folder, parent=self)
 
 
 def project_status(path):
@@ -1471,6 +3018,10 @@ class App(tk.Tk):
         self._update_ready = None      # path of a downloaded newer exe
         self._update_available = None  # {tag,size,date} seen but not taken
         self._update_busy = False
+        self._invitations = []         # what GitHub last said is waiting
+        self._invite_watchers = []     # windows to tell when that changes
+        self._team_people = []         # everyone on this project, freshest first
+        self._team_activity = {}       # {name: (3h, 24h, 7d)} - only when needed
         clean_old_exe()
         refresh_desktop_shortcut(self.cfg)
         install_editor_extension()
@@ -1501,6 +3052,11 @@ class App(tk.Tk):
         self.after(1500, self._poll_git)
         self.after(4000, self._update_tick)
         self.protocol("WM_DELETE_WINDOW", self._close)
+        # Who am I, who do I work with, who has invited me - asked once at
+        # startup, off the main thread. Started late enough that the window is
+        # already on screen: the answers only decorate it.
+        self.after(900, lambda: threading.Thread(target=self._probe_account, daemon=True).start())
+        self.after(60000, self._invite_tick)
 
         remembered = self.repo
         if remembered and os.path.isdir(os.path.join(remembered, ".git")):
@@ -1531,6 +3087,16 @@ class App(tk.Tk):
         self.topbar.pack(fill="x", pady=(0, 10))
         ttk.Button(self.topbar, text="Help", width=8,
                    command=self._show_help).pack(side="left")
+        # Beside Help on the top line, not down among the working buttons:
+        # an invitation is news about the estate, not an action on today's
+        # file. Like the estate strip it appears only while a project is
+        # open - on the welcome screen the same news rides as a number on the
+        # Join button, where it is already the reason to press Join.
+        self.req_row = ttk.Frame(self.topbar)
+        self.req_btn = button(self.req_row, "Requests received", self._open_requests)
+        self.req_btn.pack(side="left")
+        help_button(self.req_row, "requests").pack(side="left", padx=(3, 0))
+        set_request_button(self.req_btn, [])
         # The estate-management strip: buttons that govern the whole project
         # rather than the work of the moment. They share the top line with
         # Help, and appear only while a project is open - the top bar itself
@@ -1539,6 +3105,8 @@ class App(tk.Tk):
         self.btn_sync = button(self.mgmt_row, "Stop sync", self.toggle_sync)
         self.btn_sync.pack(side="left")
         help_button(self.mgmt_row, "syncbtn").pack(side="left", padx=(3, 10))
+        button(self.mgmt_row, "Add people", self._add_people).pack(side="left")
+        help_button(self.mgmt_row, "addpeople").pack(side="left", padx=(3, 10))
         button(self.mgmt_row, "Switch project", self._switch).pack(side="left")
         help_button(self.mgmt_row, "switch").pack(side="left", padx=(3, 10))
         button(self.mgmt_row, "Disconnect", self._disconnect, danger=True).pack(side="left")
@@ -1582,9 +3150,8 @@ class App(tk.Tk):
 
         partner_row = ttk.Frame(right)
         partner_row.pack(anchor="e")
-        self.partner_pill = Pill(partner_row)
-        self.partner_pill.pack(side="left")
-        self.partner_pill.set("partner: -", MUTED)
+        self.team = TeamPanel(partner_row, self._show_team)
+        self.team.pack(side="left")
         help_button(partner_row, "partner").pack(side="left")
 
         # The live "working on" line. Not a log entry that scrolls away: it
@@ -1640,13 +3207,19 @@ class App(tk.Tk):
 
         for text, cmd, key, primary in (
             ("Start a new shared project", lambda: self._setup("owner"), "start_new", True),
-            ("Join a project someone shared with me", lambda: self._setup("friend"), "join", False),
+            ("Join a project someone shared with me", self._join, "join", False),
             ("Open a project already on this machine", self._open_existing, "open_existing", False),
         ):
             row = ttk.Frame(self.welcome_actions)
             row.pack(anchor="w", pady=4)
-            button(row, text, cmd, primary=primary).pack(side="left")
+            btn = button(row, text, cmd, primary=primary)
+            btn.pack(side="left")
             help_button(row, key).pack(side="left", padx=(6, 0))
+            if key == "join":
+                # The count rides on the join button itself rather than on a
+                # button of its own: on this screen an invitation is a reason
+                # to press Join, not a separate errand.
+                self.join_btn = btn
 
         # project view
         self.project = ttk.Frame(self.body)
@@ -1666,6 +3239,7 @@ class App(tk.Tk):
         action(bar, "Open folder", self._open_folder, "openfolder")
         action(bar, "Change folder", self._relocate, "relocate")
         action(bar, "History", self._show_history, "history")
+        self.btn_conflicts = action(bar, "Conflicts", self._show_conflicts, "conflicts")
 
         self.banner = ttk.Frame(self.project, padding=(18, 12))
         self.banner_lbl = ttk.Label(self.banner, text="", font=FONT_B,
@@ -1703,8 +3277,115 @@ class App(tk.Tk):
         for tag, col in (("ok", OK), ("warn", WARN), ("bad", BAD), ("dim", MUTED)):
             self.log.tag_configure(tag, foreground=col)
 
+    # -- people, identity and invitations ----------------------------------
+
+    def _probe_account(self):
+        """Ask GitHub who this person is, who they work with, and who invited them.
+
+        One background pass rather than three, because all three answers come
+        from the same signed-in account and the same round trips. Off the main
+        thread: every call here can hang on a slow network, and the window
+        must stay alive. Nothing here writes to a widget - the results are
+        handed back through `after`, per the rule that Tk belongs to the main
+        thread.
+        """
+        try:
+            detect_identity(self.cfg)
+            refresh_people(self.cfg)
+            invites = pending_invitations()
+        except Exception:
+            return
+        self.after(0, lambda: self._account_ready(invites))
+
+    def _account_ready(self, invites):
+        """Main-thread half of the probe: save what was learned and show it."""
+        save_config(self.cfg)
+        self._set_invitations(invites)
+
+    # -- the invitation list, and everything watching it -------------------
+
+    def invitations(self):
+        return list(self._invitations)
+
+    def watch_invitations(self, callback):
+        """Every window showing invitations asks to be told when they change.
+
+        Kept as a list of callbacks rather than each window polling on its own
+        timer: one question to GitHub, one answer, every screen consistent.
+        """
+        if callback not in self._invite_watchers:
+            self._invite_watchers.append(callback)
+
+    def unwatch_invitations(self, callback):
+        if callback in self._invite_watchers:
+            self._invite_watchers.remove(callback)
+
+    def _set_invitations(self, invites):
+        self._invitations = list(invites or [])
+        # The two faces of the same news: a number on the join button of the
+        # first screen, and the button inside a project - so it is seen from
+        # wherever the person happens to be sitting.
+        set_join_button(self.join_btn, self._invitations)
+        set_request_button(self.req_btn, self._invitations)
+        # A copy, because a watcher may close its window and unregister
+        # itself while this loop is running.
+        for callback in list(self._invite_watchers):
+            try:
+                callback(self._invitations)
+            except tk.TclError:
+                self.unwatch_invitations(callback)   # its window is gone
+
+    def drop_invitation(self, invitation_id):
+        """Take one answered invitation off every screen, at once.
+
+        An invitation that has just been accepted or declined is gone, and
+        the count must say so in the same breath as the press - waiting for
+        the next round trip would leave a number that is visibly wrong for a
+        second, on the one screen whose whole job is to be trusted. GitHub is
+        asked again straight afterwards, so this is a head start on the
+        truth, never a substitute for it.
+
+        Safe from any thread.
+        """
+        def apply():
+            self._set_invitations([i for i in self._invitations
+                                   if i.get("id") != invitation_id])
+            self.refresh_invitations()
+        self.after(0, apply)
+
+    def refresh_invitations(self):
+        """Ask GitHub again, off the main thread, and tell everyone watching."""
+        def work():
+            try:
+                invites = pending_invitations()
+            except Exception:
+                return
+            self.after(0, lambda: self._set_invitations(invites))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _invite_tick(self):
+        """Look for new invitations about once a minute, for as long as the
+        app is open. A conditional request makes an unchanged answer free, so
+        the button can un-grey by itself without anyone pressing anything."""
+        self.refresh_invitations()
+        self.after(60000, self._invite_tick)
+
+    def _show_conflicts(self):
+        ConflictReportsWindow(self, self)
+
+    def _add_people(self):
+        AddPeopleWindow(self, self)
+
+    def _open_requests(self):
+        RequestsWindow(self, self, lambda inv: self._setup("friend", invite=inv))
+
+    def _join(self):
+        """The join button: offer the waiting requests, or the manual way."""
+        JoinChooser(self, self, self._open_requests, lambda: self._setup("friend"))
+
     def _show_welcome(self):
         self.mgmt_row.pack_forget()
+        self.req_row.pack_forget()
         self.project.pack_forget()
         self.welcome.pack(fill="both", expand=True)
         self.caption_lbl.config(text="")
@@ -1714,6 +3395,7 @@ class App(tk.Tk):
 
     def _show_project(self):
         self.mgmt_row.pack(side="right")
+        self.req_row.pack(side="left", padx=(10, 0))
         self.missing.pack_forget()
         self.welcome.pack_forget()
         self.project.pack(fill="both", expand=True)
@@ -2292,8 +3974,8 @@ class App(tk.Tk):
 
     # -- setup -------------------------------------------------------------
 
-    def _setup(self, mode):
-        dlg = SetupDialog(self, mode, self.cfg)
+    def _setup(self, mode, invite=None):
+        dlg = SetupDialog(self, mode, self.cfg, invite=invite)
         self.wait_window(dlg)
         if not dlg.result:
             return
@@ -2301,6 +3983,9 @@ class App(tk.Tk):
         for key in ("me", "email", "friend", "owner"):
             if v.get(key):
                 self.cfg[key] = v[key]
+        for login in v.get("people", []):
+            remember_person(self.cfg, login)
+        save_config(self.cfg)
 
         script = resource_path("engine", "init-owner.ps1" if mode == "owner" else "init-friend.ps1")
         cmd = [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-NoWatch"]
@@ -2323,15 +4008,44 @@ class App(tk.Tk):
         self._show_project()
         self.say("setting up...", "warn")
         self.pill.set("setting up", WARN)
-        threading.Thread(target=self._finish_setup, args=(cmd,), daemon=True).start()
+        threading.Thread(target=self._finish_setup, args=(cmd, invite), daemon=True).start()
 
-    def _finish_setup(self, cmd):
+    def _finish_setup_prelude(self, invite):
+        """Accept the invitation, if this setup came from one.
+
+        Deliberately here and not at the click: until a folder has been
+        chosen there is nothing to download into, and an invitation accepted
+        for a cancelled dialog would be spent - it disappears from GitHub and
+        the person is left a collaborator with no copy and no button to press.
+        """
+        if not invite:
+            return True
+        self.lines.put(f"accepting the invitation to {invite['full']}...")
+        if accept_invitation(invite["id"]):
+            self.lines.put("invitation accepted")
+            # Off the count immediately - it is no longer waiting, whatever
+            # the download does next.
+            self.drop_invitation(invite["id"])
+            return True
+        self.lines.put("GitHub would not accept the invitation. It may have been "
+                       "withdrawn, or already taken on github.com.")
+        # It failed because it is gone: withdrawn, or answered elsewhere.
+        # Either way it must stop being counted.
+        self.drop_invitation(invite["id"])
+        return False
+
+    def _finish_setup(self, cmd, invite=None):
+        if not self._finish_setup_prelude(invite):
+            return
         code = self._run_and_log(cmd)
         if code == 0 and os.path.isdir(os.path.join(self.repo, ".git")):
             self.cfg["last_project"] = self.repo
             save_config(self.cfg)
             self.lines.put("setup finished - starting sync")
             self.after(200, self.start_sync)
+            # The new project brings new people with it, and the invitation
+            # just taken is no longer waiting. Re-ask rather than guess.
+            threading.Thread(target=self._probe_account, daemon=True).start()
         else:
             self.lines.put("setup did not finish. Read the messages above.")
 
@@ -2352,6 +4066,12 @@ class App(tk.Tk):
             return
         if not self.repo or not os.path.isdir(os.path.join(self.repo, ".git")):
             return
+        # Before the conflict check, not after it. A conflict of our own used
+        # to freeze this display for as long as it lasted, so the teammate
+        # who was still working looked frozen too - and their own conflict
+        # warning could never appear here.
+        self._refresh_partner()
+
         unmerged = git(self.repo, "diff", "--name-only", "--diff-filter=U")
         if unmerged:
             n = len(unmerged.splitlines())
@@ -2368,8 +4088,6 @@ class App(tk.Tk):
                     latest = os.path.join(croot, subs[-1])
             self.conflict_dir = latest
             return
-
-        self._refresh_partner()
 
         self.banner.pack_forget()
         if not self.sync_running():
@@ -2388,23 +4106,49 @@ class App(tk.Tk):
         else:
             self.pill.set("everything published", OK)
 
-    def _refresh_partner(self):
-        """Green = beating now, amber = seen earlier, grey = never joined."""
-        name, ago = partner_presence(self.repo, presence_name(self.repo))
-        if name is None:
-            label = self.cfg.get("friend") or self.cfg.get("owner") or "partner"
-            self.partner_pill.set(f"{label}: not joined yet", MUTED)
-            return
-        if ago <= 150:          # beat is every 60s; allow two misses before doubting
-            self.partner_pill.set(f"{name}: online", OK)
-        else:
-            self.partner_pill.set(f"{name}: {seen_phrase(ago)}", WARN)
+    def _show_team(self):
+        TeamWindow(self, self._team_people, self._team_activity)
 
-        busy = partner_pending_files(self.repo, presence_name(self.repo))
+    def _refresh_partner(self):
+        """Who is here: green now, grey earlier, and nobody named twice."""
+        me = presence_name(self.repo)
+        self._team_people = team_presence(self.repo, me)
+        # Only asked for when it could change the answer - the ranking exists
+        # to choose ten out of more than ten, and it caches for a minute
+        # anyway. A four-person project never pays for it.
+        self._team_activity = (recent_activity(self.repo)
+                               if len([p for p in self._team_people if p["online"]]) > TeamPanel.HOVER_MAX
+                               else {})
+        self.team.set(self._team_people, self._team_activity)
+
+        # A conflict somebody else is untangling outranks "working on": it is
+        # the one file where another change from here makes their job harder
+        # and probably causes the next conflict. Their repository is fine and
+        # nothing is blocked - this is knowledge, not a lock.
+        stuck = team_conflicts(self.repo, me)
+        if stuck:
+            lines = []
+            for who, files in stuck.items():
+                shown = ", ".join(files[:2]) + (" +%d" % (len(files) - 2) if len(files) > 2 else "")
+                lines.append("%s is resolving a conflict in %s" % (who, shown))
+            self.partner_files_lbl.config(text=latin(" · ".join(lines)), foreground=BAD)
+            self.partner_files_lbl.pack(anchor="e", after=self.team.master)
+            return
+
+        # Named per person, not pooled. With two people "someone is editing
+        # this" could only mean one person; with five it answers a question
+        # nobody asked.
+        busy = team_pending_files(self.repo, me)
         if busy:
-            shown = ", ".join(busy[:3]) + (" +%d" % (len(busy) - 3) if len(busy) > 3 else "")
-            self.partner_files_lbl.config(text=latin(("%s is working on: " % name) + shown))
-            self.partner_files_lbl.pack(anchor="e", after=self.partner_pill.master)
+            lines = []
+            for who, files in busy.items():
+                shown = ", ".join(files[:2]) + (" +%d" % (len(files) - 2) if len(files) > 2 else "")
+                lines.append("%s is working on %s" % (who, shown))
+            text = " · ".join(lines[:2])
+            if len(lines) > 2:
+                text += " · +%d more" % (len(lines) - 2)
+            self.partner_files_lbl.config(text=latin(text), foreground=WARN)
+            self.partner_files_lbl.pack(anchor="e", after=self.team.master)
         else:
             self.partner_files_lbl.pack_forget()
 

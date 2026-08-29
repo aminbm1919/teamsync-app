@@ -1,26 +1,36 @@
 # TeamSync
 
-A shared folder for two people on two Windows machines, kept in step through a
-private GitHub repository - built for teams where each person drives an AI
-agent (Claude Code, Codex, or any other) and neither wants to think about git.
+A shared folder for a small team on Windows, kept in step through a private
+GitHub repository - built for teams where each person drives an AI agent
+(Claude Code, Codex, or any other) and nobody wants to think about git.
 
-Change a file on one machine and it is on the other in a few seconds. Work
+Change a file on one machine and it is on the others in a few seconds. Work
 offline and it catches up by itself. Edit the same lines and nothing is lost:
-both versions are laid side by side and sync pauses until a human (or an
+every version is laid side by side and sync pauses until a human (or an
 agent) combines them.
+
+Two people or ten: nothing in it assumes there are only two of you.
 
 ## What it does
 
-- **Live sync** - publishes your work and brings in your teammate's, usually
+- **Live sync** - publishes your work and brings in everybody else's, usually
   within 1-3 seconds, via cheap conditional requests that cost no API quota.
-- **A visible team** - a standing light shows whether your teammate is online,
-  and an amber line names the files they have unpublished work on right now,
-  from the moment their hands touch them.
+- **A visible team** - up to five people online are named with their own
+  lights; past that it shows the count, with the names a hover away and the
+  whole team a click away. An amber line names the files each person has
+  unpublished work on right now, from the moment their hands touch them.
 - **Read-side safety** - a file you are mid-change on is never replaced under
   your hands; incoming versions wait until you publish.
-- **Honest conflicts** - same-line edits stop with both versions saved
-  (MINE / THEIRS / BASE) plus a plain-language note; same-file different-line
-  edits merge cleanly but are announced, with both originals kept.
+- **Honest conflicts** - same-line edits stop with every version saved
+  (MINE / THEIRS / BASE) plus a plain-language note naming who is actually
+  inside the incoming side; same-file different-line edits merge cleanly but
+  are announced, with the originals kept.
+- **Conflicts are the team's business** - everyone is told who is stuck and
+  on which file, and can read all three versions of it. Only the stuck
+  machine can finish its own merge, but anyone may settle the text and
+  publish it; a tick box marks who volunteered, so two people never settle
+  the same file twice. While somebody resolves, automatic publishing stands
+  back - a deliberate publish never does.
 - **Agents as first-class teammates** - three commands (`who.ps1`,
   `working.ps1`, `push-now.ps1`) let any AI agent see who is there, announce
   what it is about to change, and publish; a complete standing prompt ships
@@ -45,8 +55,13 @@ Docs, outside the app: [getting connected](docs/getting-connected.md) ·
 `agent-bundle/` has a ready-made Claude Code skill and a Codex `AGENTS.md`
 section - one copy step per machine, and your agent knows the whole protocol:
 announce before writing, read freely, publish when done, resolve conflicts
-keeping both intents, and help the humans divide the work (the people always
-hold the final decision).
+keeping EVERY intent inside them, and help the humans divide the work (the
+people always hold the final decision).
+
+Both files are generated from the app's own prompt by
+`agent-bundle/regenerate.ps1`, which also refreshes the copy inside
+`TEAM-PROJECT-REFERENCE.md`. Edit the asset and run it; never edit the
+copies.
 
 ## Build from source
 

@@ -27,6 +27,11 @@ if ((git rev-parse --is-inside-work-tree 2>$null) -ne 'true') {
     Say 'This folder is not a git repository. Nothing to publish.' 'Red'; exit 1
 }
 
+# Git escapes non-ASCII paths in its output unless told not to, so a Persian
+# or Arabic file name comes back as "\331\201..." and matches nothing. The
+# engine sets this too; this script can run before the engine ever has.
+git config core.quotePath false 2>$null | Out-Null
+
 # A conflict outranks everything. Publishing on top of one is never right.
 if (@(git diff --name-only --diff-filter=U 2>$null).Count -gt 0) {
     $latest = Get-ChildItem (Join-Path $repo '_conflicts') -Directory -ErrorAction SilentlyContinue |
@@ -38,13 +43,57 @@ if (@(git diff --name-only --diff-filter=U 2>$null).Count -gt 0) {
     exit 2
 }
 
-# Is the sync app running and listening?
+# Is the sync engine running and listening?
+#
+# This used to be decided by the heartbeat's timestamp alone, with no check on
+# the process at all. The engine writes that timestamp once per pass, and a
+# pass with many network round trips can take longer than the 30 seconds this
+# allowed - so a perfectly healthy engine was declared dead and the fallback
+# below started publishing DIRECTLY, on top of an engine mid-commit or
+# mid-rebase. `git add -A` at that moment stages the other process's
+# half-applied conflict markers as if they were content.
+#
+# So the process decides. The pid alone would not be enough - Windows reuses
+# ids - which is why the engine records its start time in the lock and this
+# compares both. Only a lock written before that scheme falls back to the old
+# timestamp rule.
 $daemonAlive = $false
+$daemonPid = 0
 if (Test-Path -LiteralPath $lock) {
-    $t = (Get-Content -LiteralPath $lock | Where-Object { $_ -like 'time=*' }) -replace '^time=', ''
-    if ($t) {
-        try { $daemonAlive = ((Get-Date) - [datetime]::Parse($t)).TotalSeconds -lt 30 } catch { }
+    $lines = @(Get-Content -LiteralPath $lock -ErrorAction SilentlyContinue)
+    $get = { param($k) (($lines | Where-Object { $_ -like "$k=*" }) -replace "^$k=", '') }
+    $lockPid = & $get 'pid'
+    $recorded = & $get 'started'
+    if ($lockPid) {
+        $proc = Get-Process -Id $lockPid -ErrorAction SilentlyContinue
+        if ($proc) {
+            if ($recorded) {
+                $actual = ''
+                try { $actual = $proc.StartTime.ToString('o') } catch { }
+                if ($actual -and $actual -eq $recorded) { $daemonAlive = $true; $daemonPid = [int]$lockPid }
+            } else {
+                $t = & $get 'time'
+                if ($t) {
+                    try {
+                        if (((Get-Date) - [datetime]::Parse($t)).TotalSeconds -lt 30) {
+                            $daemonAlive = $true; $daemonPid = [int]$lockPid
+                        }
+                    } catch { }
+                }
+            }
+        }
     }
+}
+
+# A rebase in progress belongs to whoever started it. Publishing into one
+# means committing somebody else's unfinished merge, so refuse outright
+# rather than choosing a side.
+$gitDir = git rev-parse --git-dir 2>$null
+if ($gitDir -and ((Test-Path -LiteralPath (Join-Path $gitDir 'rebase-merge')) -or
+                  (Test-Path -LiteralPath (Join-Path $gitDir 'rebase-apply')))) {
+    Say 'A merge is in progress in this folder. Nothing was published.' 'Red'
+    Say 'Wait for it to finish, or resolve it, then run this again.' 'Yellow'
+    exit 1
 }
 
 if ($daemonAlive) {

@@ -17,6 +17,12 @@ param(
     [string]$RepoName,
     [string]$Me,
     [string]$MyEmail,
+    # One name or several, comma separated: "ali,sara". It is deliberately a
+    # single string rather than [string[]]: with powershell.exe -File, an array
+    # written as "-Friend a b c" binds only "a" to Friend and hands "b" to the
+    # NEXT parameter without a word of complaint - measured here, and it would
+    # have silently overwritten -Me. One string that this script splits itself
+    # cannot be mis-bound.
     [string]$Friend = '',
     [string]$Description = '',
     [switch]$NoWatch
@@ -137,13 +143,21 @@ if ($LASTEXITCODE -ne 0) { Die 'gh repo create failed. That name may already be 
 
 $owner = (gh api user --jq '.login')
 
-Step "Inviting $Friend"
-gh api -X PUT "repos/$owner/$RepoName/collaborators/$Friend" -f permission=push | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "    Could not invite automatically. Add them at:" -ForegroundColor Yellow
-    Write-Host "    https://github.com/$owner/$RepoName/settings/access"
-} else {
-    Write-Host '    Invitation sent. They must accept it before they can connect.' -ForegroundColor DarkGray
+$friends = @($Friend -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$invited = @()
+foreach ($who in $friends) {
+    Step "Inviting $who"
+    gh api -X PUT "repos/$owner/$RepoName/collaborators/$who" -f permission=push | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "    Could not invite $who automatically. Add them at:" -ForegroundColor Yellow
+        Write-Host "    https://github.com/$owner/$RepoName/settings/access"
+    } else {
+        $invited += $who
+        Write-Host "    Invitation sent to $who." -ForegroundColor DarkGray
+    }
+}
+if ($invited) {
+    Write-Host '    Their app shows the invitation and joins with one press.' -ForegroundColor DarkGray
 }
 
 Write-Host ''
@@ -151,8 +165,15 @@ Write-Host 'Done.' -ForegroundColor Green
 Write-Host "  Repository : https://github.com/$owner/$RepoName"
 Write-Host "  Folder     : $repo"
 Write-Host ''
-Write-Host "Send $Friend exactly this:" -ForegroundColor Cyan
+if ($invited) {
+    Write-Host "Invited: $($invited -join ', ')" -ForegroundColor Cyan
+    Write-Host '  They open TeamSync and the invitation is waiting on the first screen.'
+} else {
+    Write-Host 'Nobody was invited yet. Add people from the app, or at:' -ForegroundColor Cyan
+    Write-Host "  https://github.com/$owner/$RepoName/settings/access"
+}
 Write-Host ''
+Write-Host 'Without the app, the other side would run:' -ForegroundColor DarkGray
 Write-Host "  pwsh init-friend.ps1 -RepoName $RepoName -Owner $owner -Path `"C:\somewhere\$RepoName`""
 Write-Host ''
 

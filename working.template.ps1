@@ -26,7 +26,18 @@ if ($files.Count -eq 0) {
 }
 $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
 $open = @($files | ForEach-Object { @{ f = $_; dirty = $true } })
-@{ updated = $stamp; open = $open } | ConvertTo-Json -Compress |
-    Set-Content -LiteralPath $report -Encoding ascii
+$json = @{ updated = $stamp; open = $open } | ConvertTo-Json -Compress
+# UTF-8 with no byte-order mark, written straight to disk.
+#
+# This used to be `Set-Content -Encoding ascii`, which turns every non-latin
+# character into a literal "?" - measured: announcing "فصل-اول/یادداشت.md"
+# wrote "???-???/???????.md". The engine then held a file nobody has, while
+# the file actually being edited travelled to teammates unprotected. The
+# announcement is worse than useless when it names the wrong file.
+#
+# Not `-Encoding utf8` either: under Windows PowerShell 5.1 that prepends a
+# byte-order mark, and this project has already been bitten once by a reader
+# that could not see past one.
+[IO.File]::WriteAllText($report, $json, (New-Object Text.UTF8Encoding $false))
 Write-Host ('announced work in progress on: ' + ($files -join ', '))
 Write-Host 'publish with push-now.ps1 when finished - that clears this too'
