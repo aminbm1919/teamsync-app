@@ -195,6 +195,18 @@ try {
             $global:TS_LastChange = $now
         }
 
+        # The watcher can miss a write (an external tool's copy, a burst of
+        # events) - and then the quiet clock would run from a stale baseline
+        # and publish brand-new work in seconds. So dirt is cross-checked by
+        # sight: the first tick that SEES uncommitted changes with no fresh
+        # change event on record starts the clock right there.
+        $dirtyNow = @(git status --porcelain 2>$null).Count -gt 0
+        if ($dirtyNow -and -not $global:TS_WasDirty) {
+            $ref = if ($global:TS_LastChange) { $global:TS_LastChange } else { $global:TS_QuietBase }
+            if (($now - $ref).TotalSeconds -gt 30) { $global:TS_LastChange = $now }
+        }
+        $global:TS_WasDirty = $dirtyNow
+
         $quiet = if ($global:TS_LastChange) { ($now - $global:TS_LastChange).TotalSeconds }
                  else { ($now - $global:TS_QuietBase).TotalSeconds }
 

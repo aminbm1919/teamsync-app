@@ -46,8 +46,16 @@ if ($seen.Count -eq 0) {
         $ago = $now - $seen[$who]
         if ($ago -le 150) { Write-Host "  partner: $who is online now" -ForegroundColor Green }
         else {
-            $txt = if ($ago -lt 5400) { "$([int]($ago/60))m" } elseif ($ago -lt 172800) { "$([int]($ago/3600))h" } else { "$([int]($ago/86400))d" }
-            Write-Host "  partner: $who was last seen $txt ago" -ForegroundColor Yellow
+            # Same voice as the app: elapsed time under an hour, the clock after.
+            if ($ago -lt 3600) {
+                Write-Host "  partner: $who was last seen $([int]($ago/60))m ago" -ForegroundColor Yellow
+            } else {
+                $then = (Get-Date).AddSeconds(-$ago)
+                $day = if ($then.Date -eq (Get-Date).Date) { 'today' }
+                       elseif ($then.Date -eq (Get-Date).Date.AddDays(-1)) { 'yesterday' }
+                       else { $then.ToString('yyyy-MM-dd') }
+                Write-Host "  partner: $who was last seen $day at $($then.ToString('HH:mm'))" -ForegroundColor Yellow
+            }
         }
     }
 }

@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.parse
 from tkinter import filedialog, messagebox, ttk
 
 try:
@@ -33,7 +34,7 @@ except Exception:                     # packaging or antivirus can lose it
     sv_ttk = None
 
 APP_NAME = "TeamSync"
-APP_VERSION = "2.0.22"          # compared against the newest release tag
+APP_VERSION = "2.0.28"          # compared against the newest release tag
 UPDATE_REPO = "aminbm1919/teamsync-app"   # private; both sides have access
 # The app ships as a folder, not a single file. A one-file build unpacks ~970
 # files into %TEMP% on every launch, and on a machine whose antivirus interferes
@@ -241,14 +242,39 @@ def presence_name(repo):
     return re.sub(r"[^A-Za-z0-9._-]+", "-", n).strip("-")
 
 
+def seen_phrase(ago_seconds):
+    """When the partner was last here, said the way a person would.
+
+    Under an hour, elapsed time reads naturally ("seen 45m ago"). Past an
+    hour, arithmetic stops being kind - "seen 1h 5m ago" makes the reader
+    compute - so it switches to the clock: today at 14:30, yesterday at
+    14:30, or the date for anything older.
+    """
+    if ago_seconds < 3600:
+        return "seen " + humanise(ago_seconds) + " ago"
+    import datetime as _dt
+    then = _dt.datetime.now() - _dt.timedelta(seconds=ago_seconds)
+    clock = then.strftime("%H:%M")
+    today = _dt.date.today()
+    if then.date() == today:
+        return "seen today at " + clock
+    if then.date() == today - _dt.timedelta(days=1):
+        return "seen yesterday at " + clock
+    return "seen " + then.strftime("%Y-%m-%d") + " at " + clock
+
+
 def humanise(seconds):
+    # Compound above the unit boundary: "65m" reads like a typo, "1h 5m" like
+    # a clock. The remainder is dropped only when it is zero.
     if seconds < 90:
         return f"{seconds}s"
-    if seconds < 5400:
+    if seconds < 3600:
         return f"{seconds // 60}m"
     if seconds < 172800:
-        return f"{seconds // 3600}h"
-    return f"{seconds // 86400}d"
+        h, m = seconds // 3600, (seconds % 3600) // 60
+        return f"{h}h {m}m" if m else f"{h}h"
+    d, h = seconds // 86400, (seconds % 86400) // 3600
+    return f"{d}d {h}h" if h else f"{d}d"
 
 
 
@@ -881,14 +907,64 @@ def create_desktop_shortcut():
     return False, (out.stderr or out.stdout or "Windows refused to create the shortcut.").strip()
 
 
+def register_editor_extension(base, dst):
+    """List the planted extension in the editor's own install registry.
+
+    Modern VS Code and its forks load only extensions recorded in
+    extensions/extensions.json; a folder merely sitting in the extensions
+    directory is ignored - measured on VS Code 1.124, where the planted
+    folder stayed invisible to --list-extensions until this entry existed.
+    Old builds scan the folder and never read the entry, so writing both
+    serves every version. The editor rewrites the registry when it exits and
+    may drop an entry added while it was running; planting runs at every app
+    start, so the entry returns until an editor restart finally carries it in.
+    """
+    reg = os.path.join(base, "extensions", "extensions.json")
+    try:
+        entries = []
+        if os.path.exists(reg):
+            with open(reg, encoding="utf-8") as fh:
+                entries = json.load(fh)
+        if not isinstance(entries, list):
+            return
+        for e in entries:
+            if isinstance(e, dict) and \
+                    (e.get("identifier") or {}).get("id") == "teamsync-local.teamsync-presence":
+                return
+        fs_path = dst[0].lower() + dst[1:]
+        posix = "/" + fs_path.replace("\\", "/")
+        entries.insert(0, {
+            "identifier": {"id": "teamsync-local.teamsync-presence"},
+            "version": "1.0.0",
+            "location": {"$mid": 1, "fsPath": fs_path, "_sep": 1,
+                         "external": "file://" + urllib.parse.quote(posix),
+                         "path": posix, "scheme": "file"},
+            "relativeLocation": "teamsync.presence-1.0.0",
+            "metadata": {"isApplicationScoped": False, "isMachineScoped": False,
+                         "isBuiltin": False,
+                         "installedTimestamp": int(time.time() * 1000),
+                         "pinned": False, "source": "vsix"},
+        })
+        # Written whole to a side file first: a torn registry would cost the
+        # editor every extension it knows, not just ours.
+        tmp = reg + ".teamsync-tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(entries, fh, separators=(",", ":"))
+        os.replace(tmp, reg)
+    except (OSError, ValueError):
+        return
+
+
 def install_editor_extension():
     """Plant the editor-presence extension where VS Code loads extensions from.
 
     The extension is TeamSync's eyes inside the editor: which project files
     are open, which carry unsaved typing, and the moment they close - facts
-    Windows itself keeps no record of. VS Code scans this folder when it
-    starts, so a fresh copy is picked up at the editor's next restart. With no
-    VS Code on the machine the folder simply sits unread; nothing breaks.
+    Windows itself keeps no record of. Planting is two acts: the files copied
+    into the editor's extensions folder, and the entry in its install
+    registry that makes modern builds actually load them. Both are picked up
+    at the editor's next restart. With no VS Code on the machine the folder
+    simply sits unread; nothing breaks.
     """
     src = resource_path("editor-extension")
     if not os.path.isdir(src):
@@ -912,6 +988,8 @@ def install_editor_extension():
                         fh.write(body)
         except OSError:
             continue
+        if os.path.isdir(dst):
+            register_editor_extension(base, dst)
 
 
 def refresh_desktop_shortcut(cfg):
@@ -1211,6 +1289,31 @@ class SetupDialog(tk.Toplevel):
         self.destroy()
 
 
+def project_status(path):
+    """One project's state at a glance, for the chooser's per-row light.
+
+    The same signals the main window's pill uses, read from that project's
+    own repository - so every row in the list answers for itself, not for
+    whichever project happens to be on screen. Returns (text, tag).
+    """
+    if not os.path.isdir(os.path.join(path, ".git")):
+        return ("folder is missing", "missing")
+    g = os.path.join(path, ".git")
+    rebasing = (os.path.isdir(os.path.join(g, "rebase-merge"))
+                or os.path.isdir(os.path.join(g, "rebase-apply")))
+    if rebasing or git(path, "diff", "--name-only", "--diff-filter=U"):
+        return ("conflict - needs attention", "bad")
+    dirty = bool(git(path, "status", "--porcelain"))
+    ahead = git(path, "rev-list", "--count", "origin/main..HEAD") or "0"
+    engine = daemon_pid(path) is not None
+    if dirty or ahead != "0":
+        what = (ahead + " unpublished") if ahead != "0" else "unsaved changes"
+        return (what + (", syncing" if engine else ", engine off"), "warn")
+    if engine:
+        return ("all published, syncing", "ok")
+    return ("all published, engine off", "idle")
+
+
 class ProjectChooser(tk.Toplevel):
     """Pick from what has been opened before, instead of hunting for a folder.
 
@@ -1240,26 +1343,45 @@ class ProjectChooser(tk.Toplevel):
 
         holder = ttk.Frame(wrap)
         holder.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(holder, columns=("path",), show="tree headings",
+        self.tree = ttk.Treeview(holder, columns=("status", "path"), show="tree headings",
                                  selectmode="browse", height=8)
         self.tree.heading("#0", text="Project")
+        self.tree.heading("status", text="State")
         self.tree.heading("path", text="Folder")
-        self.tree.column("#0", width=210, stretch=False)
-        self.tree.column("path", width=380)
+        self.tree.column("#0", width=190, stretch=False)
+        self.tree.column("status", width=185, stretch=False)
+        self.tree.column("path", width=330)
         bar = ttk.Scrollbar(holder, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=bar.set)
         self.tree.pack(side="left", fill="both", expand=True)
         bar.pack(side="right", fill="y")
         self.tree.tag_configure("missing", foreground=BAD)
+        self.tree.tag_configure("bad", foreground=BAD)
+        self.tree.tag_configure("warn", foreground=WARN)
+        self.tree.tag_configure("ok", foreground=OK)
+        self.tree.tag_configure("idle", foreground=MUTED)
+
+        # Tk renders emoji glyphs in monochrome, so a text lamp can never be
+        # green - these are painted pixel by pixel instead, like the pills at
+        # the top of the main window. Kept on self: Tk shows an image only for
+        # as long as a Python reference keeps it alive.
+        def lamp(color, size=11):
+            img = tk.PhotoImage(width=size, height=size)
+            r = size // 2
+            for yy in range(size):
+                for xx in range(size):
+                    if (xx - r) ** 2 + (yy - r) ** 2 <= r * r:
+                        img.put(color, (xx, yy))
+            return img
+        self._lamps = {"ok": lamp(OK), "warn": lamp(WARN), "bad": lamp(BAD),
+                       "idle": lamp(MUTED), "missing": lamp("#5a3a3a")}
 
         for entry in self.projects:
             path = entry.get("path", "")
-            here = os.path.isdir(os.path.join(path, ".git"))
             name = entry.get("name") or os.path.basename(path.rstrip(chr(92) + "/")) or path
-            if not here:
-                name += "   (folder is missing)"
-            self.tree.insert("", "end", text=name, values=(path,),
-                             tags=() if here else ("missing",))
+            state, tag = project_status(path)
+            self.tree.insert("", "end", text=" " + name, image=self._lamps[tag],
+                             values=(latin(state), path), tags=(tag,))
         if self.projects:
             first = self.tree.get_children()[0]
             self.tree.selection_set(first)
@@ -1285,7 +1407,10 @@ class ProjectChooser(tk.Toplevel):
         if not sel:
             messagebox.showinfo(APP_NAME, "Select a project first.", parent=self)
             return None
-        return self.tree.item(sel[0], "values")[0]
+        # values = (status, path) since the state column arrived; the path is
+        # the second value - returning the first would hand back "all
+        # published" as a folder name.
+        return self.tree.item(sel[0], "values")[1]
 
     def _open(self):
         path = self._selected_path()
@@ -1406,6 +1531,19 @@ class App(tk.Tk):
         self.topbar.pack(fill="x", pady=(0, 10))
         ttk.Button(self.topbar, text="Help", width=8,
                    command=self._show_help).pack(side="left")
+        # The estate-management strip: buttons that govern the whole project
+        # rather than the work of the moment. They share the top line with
+        # Help, and appear only while a project is open - the top bar itself
+        # is permanent, the welcome screen has nothing to manage.
+        self.mgmt_row = ttk.Frame(self.topbar)
+        self.btn_sync = button(self.mgmt_row, "Stop sync", self.toggle_sync)
+        self.btn_sync.pack(side="left")
+        help_button(self.mgmt_row, "syncbtn").pack(side="left", padx=(3, 10))
+        button(self.mgmt_row, "Switch project", self._switch).pack(side="left")
+        help_button(self.mgmt_row, "switch").pack(side="left", padx=(3, 10))
+        button(self.mgmt_row, "Disconnect", self._disconnect, danger=True).pack(side="left")
+        help_button(self.mgmt_row, "disconnect").pack(side="left", padx=(3, 0))
+
         self.shortcut_row = ttk.Frame(self.topbar)
         ttk.Button(self.shortcut_row, text="Add to desktop", width=15,
                    command=self._make_shortcut).pack(side="left")
@@ -1525,12 +1663,9 @@ class App(tk.Tk):
             return b
 
         self.btn_push = action(bar, "Publish now", self.push_now, "publish", primary=True)
-        self.btn_sync = action(bar, "Stop sync", self.toggle_sync, "syncbtn")
         action(bar, "Open folder", self._open_folder, "openfolder")
         action(bar, "Change folder", self._relocate, "relocate")
         action(bar, "History", self._show_history, "history")
-        action(bar, "Disconnect", self._disconnect, "disconnect", danger=True, side="right")
-        action(bar, "Switch project", self._switch, "switch", side="right")
 
         self.banner = ttk.Frame(self.project, padding=(18, 12))
         self.banner_lbl = ttk.Label(self.banner, text="", font=FONT_B,
@@ -1569,6 +1704,7 @@ class App(tk.Tk):
             self.log.tag_configure(tag, foreground=col)
 
     def _show_welcome(self):
+        self.mgmt_row.pack_forget()
         self.project.pack_forget()
         self.welcome.pack(fill="both", expand=True)
         self.caption_lbl.config(text="")
@@ -1577,6 +1713,7 @@ class App(tk.Tk):
         self.pill.set("idle", MUTED)
 
     def _show_project(self):
+        self.mgmt_row.pack(side="right")
         self.missing.pack_forget()
         self.welcome.pack_forget()
         self.project.pack(fill="both", expand=True)
@@ -2261,7 +2398,7 @@ class App(tk.Tk):
         if ago <= 150:          # beat is every 60s; allow two misses before doubting
             self.partner_pill.set(f"{name}: online", OK)
         else:
-            self.partner_pill.set(f"{name}: seen {humanise(ago)} ago", WARN)
+            self.partner_pill.set(f"{name}: {seen_phrase(ago)}", WARN)
 
         busy = partner_pending_files(self.repo, presence_name(self.repo))
         if busy:
@@ -2345,7 +2482,14 @@ class App(tk.Tk):
             return
         self.update_btn.config(text=latin("Version " + info["tag"] + " is out - get it"))
         self.update_btn.pack(side="right", padx=(8, 0))
-        self.lines.put("a newer version is available: " + info["tag"])
+        # Announced once per version, not once per call: the 15-second check
+        # re-shows the offer to keep the button in place, and on a machine
+        # where the button sat untaken for hours that meant hundreds of
+        # identical log lines. The button itself is the standing reminder;
+        # the log line only marks the news.
+        if getattr(self, "_offer_logged", None) != info["tag"]:
+            self._offer_logged = info["tag"]
+            self.lines.put("a newer version is available: " + info["tag"])
 
     def show_progress(self, done, total, what="downloading"):
         """Called from the download thread; hops back to the UI thread to draw."""
