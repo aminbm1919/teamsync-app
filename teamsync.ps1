@@ -139,6 +139,12 @@ if ($named.Action -eq 'refused') {
     Write-Log "refusing to start: the name '$($named.Name)' belongs to $($named.Owner)" 'Red'
     exit 1
 }
+if ($named.Action -eq 'restored') {
+    Write-Host ''
+    Write-Host "Your other machine has gone quiet, so this one is '$($named.Name)' again." -ForegroundColor Cyan
+    Write-Host ''
+    Write-Log "back to publishing as '$($named.Name)' - '$($named.From)' is no longer needed" 'Cyan'
+}
 if ($named.Action -eq 'renamed') {
     # The SAME person, on a second machine. That is an ordinary thing to do
     # and is not refused - the two just have to be tellable apart, so this

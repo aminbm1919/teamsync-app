@@ -38,7 +38,7 @@ APP_NAME = "TeamSync"
 # and third are single digits, so the line runs 2.1.0 ... 2.1.9, then 2.2.0,
 # on to 2.9.9, and then 3.0.0. publish-release.ps1 refuses anything else, so
 # the rule cannot be broken by forgetting it.
-APP_VERSION = "2.1.0"           # compared against the newest release tag
+APP_VERSION = "2.1.1"           # compared against the newest release tag
 UPDATE_REPO = "aminbm1919/teamsync-app"   # private; both sides have access
 # The app ships as a folder, not a single file. A one-file build unpacks ~970
 # files into %TEMP% on every launch, and on a machine whose antivirus interferes
@@ -236,6 +236,17 @@ def kill_pid(pid):
 ONLINE_SECONDS = 150       # the engine beats every 60 s; this allows two misses
 
 
+def _is_me(name, mine):
+    """Is this ref name one of ours? `mine` may be a name or a set of them.
+
+    Two Amins on two laptops SHOULD both be listed - that is a real team of
+    one person at two desks. What must never be listed is one Amin twice.
+    """
+    if isinstance(mine, (set, frozenset, list, tuple)):
+        return name in mine
+    return name == mine
+
+
 def team_presence(repo, my_name):
     """Everyone else on this project, freshest beat first.
 
@@ -260,7 +271,7 @@ def team_presence(repo, my_name):
         if len(parts) < 5:
             continue
         name, ts = parts[3], parts[4]
-        if not name or name == my_name:
+        if not name or _is_me(name, my_name):
             continue
         try:
             ts = int(ts)
@@ -391,7 +402,7 @@ def team_pending_files(repo, my_name):
     by_person = {}
     for line in out.splitlines():
         parts = line.strip().split("/", 4)
-        if len(parts) < 5 or not parts[3] or parts[3] == my_name:
+        if len(parts) < 5 or not parts[3] or _is_me(parts[3], my_name):
             continue
         try:
             path = bytes.fromhex(parts[4]).decode("utf-8", "replace")
@@ -416,7 +427,7 @@ def team_conflicts(repo, my_name):
     by_person = {}
     for line in out.splitlines():
         parts = line.strip().split("/", 4)
-        if len(parts) < 5 or not parts[3] or parts[3] == my_name:
+        if len(parts) < 5 or not parts[3] or _is_me(parts[3], my_name):
             continue
         try:
             path = bytes.fromhex(parts[4]).decode("utf-8", "replace")
@@ -587,9 +598,25 @@ def clear_my_presence(repo, my_name):
 
 def presence_name(repo):
     """The same sanitised name the engine publishes under."""
-    import re
-    n = git(repo, "config", "user.name") or os.environ.get("USERNAME", "")
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", n).strip("-")
+    return sanitise_name(git(repo, "config", "user.name")
+                         or os.environ.get("USERNAME", ""))
+
+
+def my_own_names(repo):
+    """Every name THIS machine publishes, or has published, on this project.
+
+    Normally just one. But when the engine numbers a second machine it keeps
+    the name it came from, and a beat left behind by the previous run can
+    outlive it by a couple of minutes - so without this a person sees
+    themselves listed as a teammate, with a last-seen time from their own
+    last session. Measured on the user's own screen: "amin" appeared beside
+    "amin-2", both of them him.
+    """
+    names = {presence_name(repo)}
+    came = git(repo, "config", "--local", "teamsync.renamedfrom")
+    if came:
+        names.add(sanitise_name(came))
+    return {n for n in names if n}
 
 
 def seen_phrase(ago_seconds):
@@ -2574,10 +2601,15 @@ class AddPeopleWindow(tk.Toplevel):
     choose a person, wherever you are choosing them.
     """
 
-    def __init__(self, parent, app_window):
+    def __init__(self, parent, app_window, repo=None):
         super().__init__(parent)
         self.app = app_window
-        self.slug = repo_slug(app_window.repo)
+        # Bound to ONE project, named on the window, and never to "whichever
+        # project happened to be open last". From the project screen that is
+        # the open one; from the welcome screen the person picks it first, so
+        # the window can still only ever act on the project it names.
+        self.repo = repo or app_window.repo
+        self.slug = repo_slug(self.repo)
         self.title("Add people to this project")
         self.resizable(False, False)
         self.transient(parent)
@@ -2588,7 +2620,9 @@ class AddPeopleWindow(tk.Toplevel):
         ttk.Label(wrap, text="Add people to this project", font=FONT_H,
                   foreground=FG).pack(anchor="w")
         ttk.Label(wrap, text=latin(self.slug or "(no GitHub remote)"),
-                  font=FONT, foreground=ACCENT).pack(anchor="w", pady=(2, 10))
+                  font=FONT, foreground=ACCENT).pack(anchor="w", pady=(2, 2))
+        ttk.Label(wrap, text=latin(os.path.basename(self.repo.rstrip("\\/")) if self.repo else ""),
+                  font=("Segoe UI", 8), foreground=MUTED).pack(anchor="w", pady=(0, 10))
 
         self.note = ttk.Label(wrap, text="", font=FONT, foreground=MUTED, justify="left")
         self.note.pack(anchor="w", pady=(0, 8))
@@ -3209,6 +3243,7 @@ class App(tk.Tk):
             ("Start a new shared project", lambda: self._setup("owner"), "start_new", True),
             ("Join a project someone shared with me", self._join, "join", False),
             ("Open a project already on this machine", self._open_existing, "open_existing", False),
+            ("Add people to a project", self._add_people, "addpeople", False),
         ):
             row = ttk.Frame(self.welcome_actions)
             row.pack(anchor="w", pady=4)
@@ -3373,8 +3408,28 @@ class App(tk.Tk):
     def _show_conflicts(self):
         ConflictReportsWindow(self, self)
 
-    def _add_people(self):
-        AddPeopleWindow(self, self)
+    def _add_people(self, repo=None):
+        """Invite people to ONE project - the open one, or one chosen first."""
+        target = repo or self.repo
+        if not target:
+            # From the welcome screen there is no open project, so the
+            # question "which one?" has to be answered before anything else.
+            # Offering the last-used project silently would invite people to a
+            # project the person is not looking at.
+            known = [e for e in self.cfg.get("projects", [])
+                     if os.path.isdir(os.path.join(e.get("path", ""), ".git"))]
+            if not known:
+                messagebox.showinfo(
+                    APP_NAME,
+                    "There is no project on this machine to add people to." + NN +
+                    "Start a shared project first, or join one.")
+                return
+            dlg = ProjectChooser(self, known)
+            self.wait_window(dlg)
+            if not dlg.result or dlg.result[0] != "open":
+                return
+            target = dlg.result[1]
+        AddPeopleWindow(self, self, repo=target)
 
     def _open_requests(self):
         RequestsWindow(self, self, lambda inv: self._setup("friend", invite=inv))
@@ -4111,7 +4166,7 @@ class App(tk.Tk):
 
     def _refresh_partner(self):
         """Who is here: green now, grey earlier, and nobody named twice."""
-        me = presence_name(self.repo)
+        me = my_own_names(self.repo)
         self._team_people = team_presence(self.repo, me)
         # Only asked for when it could change the answer - the ranking exists
         # to choose ten out of more than ten, and it caches for a minute

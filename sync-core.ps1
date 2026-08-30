@@ -339,6 +339,23 @@ function Resolve-MyName {
     $me = Get-PresenceName
     if (-not $me) { return @{ Name = ''; Action = 'ok' } }
     $mine = Get-MyGitHubLogin
+
+    # Did WE take this numbered name, and is the original free again? A rename
+    # must be able to undo itself: it is a machine's guess about another
+    # machine, and a guess that can only ever accumulate would leave somebody
+    # as name-7 for ever because of restarts nobody remembers.
+    $came = git config --local teamsync.renamedfrom 2>$null
+    if ($came) {
+        $came = "$came".Trim()
+        $owner0 = Get-NameOwner $came
+        if ((-not $owner0 -or -not $mine -or $owner0 -eq $mine) -and -not (Test-NameBeating $came)) {
+            git config user.name $came 2>$null | Out-Null
+            git config --local --unset teamsync.renamedfrom 2>$null | Out-Null
+            $script:SC_IdentityRef = $null
+            return @{ Name = $came; Action = 'restored'; From = $me }
+        }
+    }
+
     $owner = Get-NameOwner $me
 
     if ($owner -and $mine -and $owner -ne $mine) {
@@ -357,20 +374,48 @@ function Resolve-MyName {
         if ($who -and $mine -and $who -ne $mine) { continue }   # somebody else's
         if (Test-NameBeating $try) { continue }                 # a live machine of ours
         git config user.name $try 2>$null | Out-Null
+        # Remember where we came from, so this can be given back when the
+        # original name falls quiet again.
+        git config --local teamsync.renamedfrom $me 2>$null | Out-Null
         $script:SC_IdentityRef = $null
         return @{ Name = $try; Action = 'renamed'; From = $me }
     }
     return @{ Name = $me; Action = 'ok' }
 }
 
+function Get-MyLastPresenceRef {
+    # The last beat THIS machine published, remembered across restarts.
+    #
+    # In memory alone it was useless for the question it exists to answer: a
+    # restart forgets it, and the beat the previous run left behind - still
+    # fresh, because it stopped seconds ago - then looks like a second machine
+    # of ours. The app renamed itself to name-2 on its own restart and the
+    # person watched themselves appear in the team list as a stranger.
+    #
+    # Kept in the project's own git config, which is local to this clone and
+    # never travels.
+    if ($script:SC_MyPresenceRef) { return $script:SC_MyPresenceRef }
+    $v = git config --local teamsync.lastpresence 2>$null
+    if ($v) { return "$v".Trim() }
+    return ''
+}
+
+function Set-MyLastPresenceRef {
+    param([string]$Ref)
+    $script:SC_MyPresenceRef = $Ref
+    if ($Ref) { git config --local teamsync.lastpresence $Ref 2>$null | Out-Null }
+    else { git config --local --unset teamsync.lastpresence 2>$null | Out-Null }
+}
+
 function Test-NameBeating {
     # Is a presence beat arriving under this name right now, from a machine
     # that is not this one?
     param([string]$Name)
-    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $now  = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $mine = Get-MyLastPresenceRef
     foreach ($line in @(git ls-remote origin "refs/teamsync/presence/$Name/*" 2>$null)) {
         $ref = ($line -split "`t")[-1]
-        if (-not $ref -or $ref -eq $script:SC_MyPresenceRef) { continue }
+        if (-not $ref -or $ref -eq $mine) { continue }
         $parts = $ref -split '/'
         if ($parts.Count -lt 5) { continue }
         $ts = 0
@@ -433,7 +478,7 @@ function Publish-Presence {
 
     git push -q origin "HEAD:$new" 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { return }          # offline; try again next tick
-    $script:SC_MyPresenceRef = $new
+    Set-MyLastPresenceRef $new
 
     if ($old) {
         # Drop the previous beat separately, so its failure cannot cancel the new one.
