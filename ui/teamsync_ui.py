@@ -20,6 +20,7 @@ import ctypes
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -38,8 +39,8 @@ APP_NAME = "TeamSync"
 # and third are single digits, so the line runs 2.1.0 ... 2.1.9, then 2.2.0,
 # on to 2.9.9, and then 3.0.0. publish-release.ps1 refuses anything else, so
 # the rule cannot be broken by forgetting it.
-APP_VERSION = "2.1.1"           # compared against the newest release tag
-UPDATE_REPO = "aminbm1919/teamsync-app"   # private; both sides have access
+APP_VERSION = "2.1.9"           # compared against the newest release tag
+UPDATE_REPO = "aminbm1919/teamsync-app"   # public since 2026-08-28: source and releases
 # The app ships as a folder, not a single file. A one-file build unpacks ~970
 # files into %TEMP% on every launch, and on a machine whose antivirus interferes
 # with that, a file is sometimes missing - which showed up as three different
@@ -239,12 +240,155 @@ ONLINE_SECONDS = 150       # the engine beats every 60 s; this allows two misses
 def _is_me(name, mine):
     """Is this ref name one of ours? `mine` may be a name or a set of them.
 
-    Two Amins on two laptops SHOULD both be listed - that is a real team of
-    one person at two desks. What must never be listed is one Amin twice.
+    One person's machines are one person here, so `mine` carries every name
+    this account has ever published under - see my_own_names.
     """
     if isinstance(mine, (set, frozenset, list, tuple)):
         return name in mine
     return name == mine
+
+
+def destructive_changes(repo):
+    """What is waiting to go out that would DESTROY work, not add to it.
+
+    The engine computes the same thing before every publish and refuses to
+    send it on its own. This is the window's copy, so it can show the person
+    what is being held and let them decide. See Get-DestructiveChanges in
+    sync-core.ps1 for the reasoning; the two must agree, and
+    test_destructive_guard proves they do.
+    """
+    deleted = [f for f in git(repo, "diff", "--name-only", "--diff-filter=D",
+                              "HEAD").splitlines() if f.strip()]
+    reverted = []
+    for f in git(repo, "diff", "--name-only", "--diff-filter=M", "HEAD").splitlines():
+        f = f.strip()
+        if not f:
+            continue
+        full = os.path.join(repo, f.replace("/", os.sep))
+        if not os.path.exists(full):
+            continue
+        now = git(repo, "hash-object", "--", full).strip()
+        if not now:
+            continue
+        for c in git(repo, "rev-list", "-n", "40", "HEAD", "--", f).splitlines():
+            c = c.strip()
+            if not c:
+                continue
+            was = git(repo, "rev-parse", "-q", "--verify", c + ":" + f).strip()
+            if was and was == now:
+                reverted.append(f)
+                break
+    return {"deleted": deleted, "reverted": reverted}
+
+
+def destructive_signature(changes):
+    """Identifies one particular accident, so a confirmation covers only it.
+
+    Ordinal sort and UPPERCASE hex to match the engine byte for byte - the
+    engine is PowerShell, whose default sort is culture-aware, so both sides
+    say ordinal explicitly.
+    """
+    import hashlib
+    paths = sorted(list(changes.get("deleted", [])) + list(changes.get("reverted", [])))
+    if not paths:
+        return ""
+    text = "\n".join(paths)
+    return hashlib.sha1(text.encode("utf-8")).hexdigest().upper()[:12]
+
+
+def approve_destructive(repo, changes):
+    """The person said they meant it. Recorded against THIS set only."""
+    git(repo, "config", "--local", "teamsync.destructiveok",
+        destructive_signature(changes))
+
+
+def restore_destructive(repo, changes):
+    """The other answer: put them back.
+
+    This is the undo the app never had. Every version has always been in every
+    clone - there was simply no door to it that did not require knowing git.
+    """
+    for f in list(changes.get("deleted", [])) + list(changes.get("reverted", [])):
+        if f:
+            git(repo, "checkout", "--", f)
+    git(repo, "config", "--local", "--unset", "teamsync.destructiveok")
+
+
+def name_logins(repo):
+    """Which GitHub account registered each name: {name: login}.
+
+    Published by the engine as refs/teamsync/identity/<name>/<login>. This is
+    the only thing on the wire that can say two different names are one
+    person, and until 2.1.4 nothing read it.
+    """
+    out = git(repo, "for-each-ref", "--format=%(refname)", "refs/teamsync/identity")
+    logins = {}
+    for line in out.splitlines():
+        parts = line.strip().split("/")
+        if len(parts) < 5:
+            continue
+        name, login = parts[3], parts[4]
+        if name and login:
+            logins[name] = login
+    return logins
+
+
+_NUMBERED = re.compile(r"^(.+)-(\d+)$")
+
+
+def person_groups(names, logins):
+    """Collapse names that are one person. Returns {name: group key}.
+
+    A name is not a person; an ACCOUNT is. Two facts can join two names:
+
+    1. They carry the same login. Certain, and the rule going forward.
+    2. One is `X-<n>` and the other is `X`, and both are present. Older
+       versions numbered a machine when they mistook the heartbeat their own
+       previous run had left behind for a live second machine - so these pairs
+       exist on real projects and were never anybody's second machine. Joined
+       UNLESS both names carry logins that differ, which proves two accounts
+       and outranks the pattern.
+
+    Anything unregistered and unpaired stays itself: we cannot prove a person
+    is somebody else, so we never guess them away.
+    """
+    names = list(names)
+    parent = {n: n for n in names}
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    by_login = {}
+    for n in names:
+        lg = logins.get(n)
+        if lg:
+            by_login.setdefault(lg, []).append(n)
+    for group in by_login.values():
+        for other in group[1:]:
+            union(group[0], other)
+
+    present = set(names)
+    for n in names:
+        m = _NUMBERED.match(n)
+        if not m:
+            continue
+        base = m.group(1)
+        if base not in present:
+            continue
+        a, b = logins.get(n), logins.get(base)
+        if a and b and a != b:
+            continue                      # two accounts - the pattern is a coincidence
+        union(base, n)
+
+    return {n: find(n) for n in names}
 
 
 def team_presence(repo, my_name):
@@ -267,21 +411,53 @@ def team_presence(repo, my_name):
     out = git(repo, "for-each-ref", "--format=%(refname)", "refs/teamsync/presence")
     freshest = {}
     for line in out.splitlines():
+        # refs/teamsync/presence/<name>/<machine>/<ts>  (this version)
+        # refs/teamsync/presence/<name>/<ts>            (before it)
+        # The timestamp is the LAST segment either way, which is what lets one
+        # reader serve a team that is halfway through an upgrade.
         parts = line.strip().split("/")
         if len(parts) < 5:
             continue
-        name, ts = parts[3], parts[4]
-        if not name or _is_me(name, my_name):
+        name = parts[3]
+        if not name:
             continue
         try:
-            ts = int(ts)
+            ts = int(parts[-1])
         except ValueError:
             continue
         if ts > freshest.get(name, -1):
             freshest[name] = ts
+
+    # A name is not a person. Names this account retired - and names an older
+    # version invented for a machine that never existed - are claimed by no
+    # live engine, so nothing sweeps their beats and every one of them used to
+    # be listed as a separate teammate for ever.
+    groups = person_groups(freshest, name_logins(repo))
+    per_person = {}
+    for name, ts in freshest.items():
+        key = groups[name]
+        best = per_person.get(key)
+        if best is None or ts > best[1]:
+            per_person[key] = (name, ts)          # the name that is actually alive
+
+    # Show the person's PLAIN name where we have it. A trailing number was
+    # never part of anybody's name: older versions added it when they mistook
+    # their own leftover heartbeat for a second machine, so a name like
+    # "someone-2" names a machine that never existed. If the plain form is in the same
+    # person's group, that is the name to put on the screen - the number is an
+    # artefact, and it stops being shown the moment we can prove it is one.
+    for key, (name, ts) in list(per_person.items()):
+        m = _NUMBERED.match(name)
+        if not m:
+            continue
+        base = m.group(1)
+        if groups.get(base) == key:
+            per_person[key] = (base, ts)
+
+    mine_keys = {groups[n] for n in freshest if _is_me(n, my_name)}
     now = int(time.time())
     people = [{"name": n, "ago": max(0, now - ts), "online": (now - ts) <= ONLINE_SECONDS}
-              for n, ts in freshest.items()]
+              for key, (n, ts) in per_person.items() if key not in mine_keys]
     people.sort(key=lambda p: (not p["online"], p["ago"], p["name"].lower()))
     return people
 
@@ -401,11 +577,14 @@ def team_pending_files(repo, my_name):
     out = git(repo, "for-each-ref", "--format=%(refname)", "refs/teamsync/pending")
     by_person = {}
     for line in out.splitlines():
-        parts = line.strip().split("/", 4)
+        # <ns>/<name>/<machine>/<hex>, or <ns>/<name>/<hex> from an older
+        # version. The path is the LAST segment either way - reading position
+        # 4 would decode the machine id as a filename and drop the real one.
+        parts = line.strip().split("/")
         if len(parts) < 5 or not parts[3] or _is_me(parts[3], my_name):
             continue
         try:
-            path = bytes.fromhex(parts[4]).decode("utf-8", "replace")
+            path = bytes.fromhex(parts[-1]).decode("utf-8", "replace")
         except ValueError:
             continue
         by_person.setdefault(parts[3], set()).add(path)
@@ -426,11 +605,14 @@ def team_conflicts(repo, my_name):
     out = git(repo, "for-each-ref", "--format=%(refname)", "refs/teamsync/conflict")
     by_person = {}
     for line in out.splitlines():
-        parts = line.strip().split("/", 4)
+        # <ns>/<name>/<machine>/<hex>, or <ns>/<name>/<hex> from an older
+        # version. The path is the LAST segment either way - reading position
+        # 4 would decode the machine id as a filename and drop the real one.
+        parts = line.strip().split("/")
         if len(parts) < 5 or not parts[3] or _is_me(parts[3], my_name):
             continue
         try:
-            path = bytes.fromhex(parts[4]).decode("utf-8", "replace")
+            path = bytes.fromhex(parts[-1]).decode("utf-8", "replace")
         except ValueError:
             continue
         by_person.setdefault(parts[3], set()).add(path)
@@ -602,6 +784,11 @@ def presence_name(repo):
                          or os.environ.get("USERNAME", ""))
 
 
+def my_machine_id(repo):
+    """This clone's own machine token, as the engine records it."""
+    return git(repo, "config", "--local", "teamsync.machine")
+
+
 def my_own_names(repo):
     """Every name THIS machine publishes, or has published, on this project.
 
@@ -616,7 +803,25 @@ def my_own_names(repo):
     came = git(repo, "config", "--local", "teamsync.renamedfrom")
     if came:
         names.add(sanitise_name(came))
-    return {n for n in names if n}
+    names = {n for n in names if n}
+    if not names:
+        return names
+
+    # And every name this ACCOUNT has ever published under, which the local
+    # config cannot know: a name retired on a previous install, or one an old
+    # version invented, still carries our login in its identity ref. Without
+    # this the person sees their own ghost as a teammate holding a file or
+    # stuck in a conflict - measured on the user's own screen as "amin-2".
+    logins = name_logins(repo)
+    known = set(logins) | names
+    out = git(repo, "for-each-ref", "--format=%(refname)", "refs/teamsync/presence")
+    for line in out.splitlines():
+        parts = line.strip().split("/")
+        if len(parts) >= 5 and parts[3]:
+            known.add(parts[3])
+    groups = person_groups(known, logins)
+    mine_keys = {groups[n] for n in names if n in groups}
+    return {n for n, key in groups.items() if key in mine_keys} | names
 
 
 def seen_phrase(ago_seconds):
@@ -1478,6 +1683,14 @@ HELP = {
         "For somebody else's conflict, \"Read all versions\" writes out all three: their version, what is on the shared branch, and what both started from. If you decide what the file should say, edit it and press Publish now - their side takes your version when it arrives.\n\n"
         "While anybody is resolving, the app stops publishing your work AUTOMATICALLY, so the ground does not move under them. Publish now and push-now.ps1 still send immediately: that is a decision, and decisions stay yours."
     ),
+    'destructive': (
+        "Changes waiting for your word.\n\n"
+        "Adding work needs no permission. Destroying it does - so when what is about to go out would DELETE a file, or put a file back to an older version of itself, the app stops and asks you first. Everything else keeps publishing as usual.\n\n"
+        "It happens by accident more often than on purpose: a file dragged to the bin, a folder restored from an old backup, an editor that saved over the newest text. Published, that removes the file or the newer wording from everybody's machine - and it used to go out with the log saying only \"pushed 1 commit(s)\".\n\n"
+        "Two answers. \"Publish these\" sends them, and they really do disappear for everyone. \"Put them back\" restores the newest version from the project's own history - nothing was ever lost, every version is here.\n\n"
+        "The confirmation covers exactly the files listed. Delete something else afterwards and you are asked again, because you have not seen that one yet.\n\n"
+        "A machine that is simply behind is never caught by this: it compares the disk against ITS OWN history, so a file it has not received yet is not a file it deleted. Signing in from a second computer is safe."
+    ),
     'requests': (
         "Requests received.\n\n"
         "When somebody invites you to a shared project, GitHub holds that invitation for you, and it is listed here: who invited you, and to which repository.\n\n"
@@ -2008,10 +2221,20 @@ def forget_person(cfg, login):
         hidden.append(login)
 
 
-_invite_etag = {"etag": None, "value": []}
+# How many conditional asks may go by before one full, unconditional read.
+# A 304 is free, which is why the poll uses one - but it also means the app
+# can only ever be as right as the last answer that was NOT a 304. Measured on
+# round 7: the button sat at its startup count for over THIRTY MINUTES while
+# GitHub's own API listed a new invitation, and opening the window - which
+# reads afresh - showed it at once. Whatever made that conditional answer go
+# stale, a cache with no floor can never recover from it on its own. Six full
+# reads an hour against a budget of five thousand is not a cost.
+INVITE_FULL_EVERY = 5
+
+_invite_etag = {"etag": None, "value": [], "conditional": 0}
 
 
-def _invitations_raw():
+def _invitations_raw(force=False):
     """The raw invitation list, asked for as cheaply as the answer allows.
 
     Asked again every minute so the button un-greys on its own, so the cost of
@@ -2026,22 +2249,27 @@ def _invitations_raw():
     import urllib.error
     import urllib.request
     req = urllib.request.Request("https://api.github.com/user/repository_invitations")
+    if force or _invite_etag["conditional"] >= INVITE_FULL_EVERY:
+        _invite_etag["etag"] = None            # ask outright, and believe it
+        _invite_etag["conditional"] = 0
     if _invite_etag["etag"]:
         req.add_header("If-None-Match", _invite_etag["etag"])
     try:
         with opener.open(req, timeout=15) as res:
             _invite_etag["etag"] = res.headers.get("ETag")
             _invite_etag["value"] = json.loads(res.read().decode("utf-8", "replace"))
+            _invite_etag["conditional"] = 0
             return _invite_etag["value"]
     except urllib.error.HTTPError as exc:
         if exc.code == 304:
+            _invite_etag["conditional"] += 1
             return _invite_etag["value"]        # unchanged since last look
         return None
     except Exception:
         return None
 
 
-def pending_invitations():
+def pending_invitations(force=False):
     """Invitations waiting for this account on GitHub.
 
     This is what closes the app's oldest piece of friction: joining used to
@@ -2050,9 +2278,14 @@ def pending_invitations():
     repository the account cannot see yet. The invitation was always readable
     through the API; nothing was ever shown.
     """
-    data = _invitations_raw()
+    data = _invitations_raw(force=force)
+    if data is None:
+        # Could not ask. That is NOT the same as "nobody has invited you", and
+        # returning an empty list here made a waiting invitation vanish off the
+        # screen on any passing network hiccup. The caller keeps what it had.
+        return None
     out = []
-    for inv in data or []:
+    for inv in data:
         repo = (inv or {}).get("repository") or {}
         full = repo.get("full_name", "")
         if not full or "/" not in full:
@@ -2648,7 +2881,7 @@ class AddPeopleWindow(tk.Toplevel):
 
     def _check_rights(self):
         allowed = repo_admin(self.slug) if self.slug else False
-        self.after(0, lambda: self._rights_known(allowed))
+        self.app.post(lambda: self._rights_known(allowed))
 
     def _rights_known(self, allowed):
         try:
@@ -2699,7 +2932,7 @@ class AddPeopleWindow(tk.Toplevel):
             self.app.lines.put(message)
             if ok:
                 remember_person(self.app.cfg, login)
-        self.after(0, lambda: self._sent(done, failed))
+        self.app.post(lambda: self._sent(done, failed))
 
     def _sent(self, done, failed):
         save_config(self.app.cfg)
@@ -2718,6 +2951,89 @@ class AddPeopleWindow(tk.Toplevel):
                 self._close()
         except tk.TclError:
             pass
+
+
+class DestructiveWindow(tk.Toplevel):
+    """What is about to destroy work, and the two answers to it.
+
+    The app publishes on its own, which is the whole point of it - but a
+    deletion and a reversion travel exactly like an edit, and were measured
+    removing a file from every teammate's machine while the log said only
+    "pushed 1 commit(s)". So the machine no longer makes that call alone.
+
+    Both answers are real. "Publish these" sends them and they are gone for
+    everyone. "Put them back" restores the newest version - the door to the
+    history that has always been in every clone and that nobody could reach
+    without knowing git.
+    """
+
+    def __init__(self, parent, app, changes):
+        super().__init__(parent)
+        self.app = app
+        self.changes = changes
+        self.title("Changes waiting for your word")
+        self.transient(parent)
+        self.grab_set()
+        self.minsize(640, 320)
+
+        wrap = ttk.Frame(self, padding=(20, 16))
+        wrap.pack(fill="both", expand=True)
+        ttk.Label(wrap, text="This would destroy work on everybody's machine",
+                  font=FONT_H, foreground="#ffd7d7").pack(anchor="w")
+        ttk.Label(wrap, text="Publishing is paused until you say. Everything else keeps syncing "
+                             "as usual.\nNothing has been lost either way - every version is "
+                             "still in the project's history.",
+                  font=FONT, foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 12))
+
+        area = ScrollArea(wrap, height=200)
+        area.pack(fill="both", expand=True)
+        body = area.inner
+
+        def section(title, files, note):
+            if not files:
+                return
+            ttk.Label(body, text=title, font=FONT_B, foreground=FG).pack(anchor="w", pady=(8, 0))
+            ttk.Label(body, text=note, font=FONT, foreground=MUTED,
+                      justify="left").pack(anchor="w", pady=(0, 4))
+            for f in files:
+                ttk.Label(body, text="   " + f, font=MONO,
+                          foreground="#ffd7d7").pack(anchor="w")
+
+        section("Would be deleted for everyone", changes.get("deleted", []),
+                "These files are in the project but no longer on this disk.")
+        section("Would be put back to an older version", changes.get("reverted", []),
+                "The text on this disk is one this file already had before - "
+                "publishing it replaces newer wording with older.")
+
+        row = ttk.Frame(wrap)
+        row.pack(fill="x", pady=(14, 0))
+        button(row, "Put them back", self._restore, primary=True).pack(side="left")
+        button(row, "Publish these", self._approve, danger=True).pack(side="left", padx=(8, 0))
+        button(row, "Decide later", self.destroy).pack(side="right")
+
+    def _restore(self):
+        n = len(self.changes.get("deleted", [])) + len(self.changes.get("reverted", []))
+        if not messagebox.askyesno(
+                "Put them back?",
+                f"Restore {n} file(s) to the newest version the project has?\n\n"
+                "Anything you typed into them since is replaced.", parent=self):
+            return
+        restore_destructive(self.app.repo, self.changes)
+        self.app.say("restored " + str(n) + " file(s) - publishing is free again")
+        self.app.refresh_destructive()
+        self.destroy()
+
+    def _approve(self):
+        n = len(self.changes.get("deleted", [])) + len(self.changes.get("reverted", []))
+        if not messagebox.askyesno(
+                "Publish these?",
+                f"Send {n} change(s) that delete or roll back work?\n\n"
+                "They will disappear from every teammate's machine too.", parent=self):
+            return
+        approve_destructive(self.app.repo, self.changes)
+        self.app.say("confirmed - " + str(n) + " destructive change(s) will publish")
+        self.app.refresh_destructive()
+        self.destroy()
 
 
 class ConflictReportsWindow(tk.Toplevel):
@@ -3047,6 +3363,12 @@ class App(tk.Tk):
         self.repo = self.cfg.get("last_project") or ""
         self.proc = None            # engine started by THIS window (else adopted by pid)
         self.lines = queue.Queue()
+        # Work handed back from background threads. `after` is NOT safe to
+        # call from another thread - it registers a Tcl command on the
+        # interpreter - and it fails outright when the main loop is not
+        # turning. A queue drained on the main thread is the same trick this
+        # app already uses for log lines, and it cannot fail that way.
+        self._jobs = queue.Queue()
         self.conflict_dir = None
         self._log_pos = 0
         self._update_ready = None      # path of a downloaded newer exe
@@ -3188,11 +3510,11 @@ class App(tk.Tk):
         self.team.pack(side="left")
         help_button(partner_row, "partner").pack(side="left")
 
-        # The live "working on" line. Not a log entry that scrolls away: it
-        # stands here for as long as the partner has unpublished hands on
-        # files, and vanishes the moment they publish.
-        self.partner_files_lbl = ttk.Label(right, text="", font=("Segoe UI", 9, "bold"),
-                                           foreground=WARN, justify="right")
+        # "Who is holding what" used to live here, as one amber line running
+        # left from the corner. It is standing STATE, not an event, and a
+        # horizontal run-on line is the one shape that cannot hold it: with two
+        # people it fitted, with ten it would push the whole header about. It
+        # now has its own column beside the log, where it grows downwards.
 
         auto_row = ttk.Frame(right)
         auto_row.pack(anchor="e")
@@ -3275,6 +3597,11 @@ class App(tk.Tk):
         action(bar, "Change folder", self._relocate, "relocate")
         action(bar, "History", self._show_history, "history")
         self.btn_conflicts = action(bar, "Conflicts", self._show_conflicts, "conflicts")
+        # Grey while nothing is held. It is the only place in the app that can
+        # stop work leaving the machine, so it says so in red when it lights.
+        self.btn_destructive = action(bar, "Needs your OK", self._show_destructive,
+                                      "destructive", danger=True)
+        self.btn_destructive.state(["disabled"])
 
         self.banner = ttk.Frame(self.project, padding=(18, 12))
         self.banner_lbl = ttk.Label(self.banner, text="", font=FONT_B,
@@ -3282,8 +3609,27 @@ class App(tk.Tk):
         self.banner_lbl.pack(side="left")
         button(self.banner, "Open both versions", self._open_conflict, danger=True).pack(side="right")
 
-        logwrap = ttk.Frame(self.project, padding=(18, 0))
-        logwrap.pack(fill="both", expand=True, pady=(0, 16))
+        split = ttk.Frame(self.project, padding=(18, 0))
+        split.pack(fill="both", expand=True, pady=(0, 16))
+
+        # Two columns, because there are two different KINDS of thing here and
+        # they were sharing one shape. The log is a stream: events, in order,
+        # each true once. "Right now" is state: who holds which file, who is
+        # stuck, what is waiting for a word - each true until it is not, and
+        # each replaced rather than appended. State in a stream scrolls away;
+        # state on one header line runs off the edge as soon as the team grows.
+        # A column does neither: it is replaced in place and grows downwards.
+        self.nowcol = ttk.Frame(split, width=300)
+        self.nowcol.pack(side="right", fill="y", padx=(16, 0))
+        self.nowcol.pack_propagate(False)
+        ttk.Label(self.nowcol, text="Right now", font=FONT_B,
+                  foreground=MUTED).pack(anchor="w", pady=(0, 6))
+        self.nowarea = ScrollArea(self.nowcol, height=200)
+        self.nowarea.pack(fill="both", expand=True)
+        self._now_signature = None
+
+        logwrap = ttk.Frame(split)
+        logwrap.pack(side="left", fill="both", expand=True)
         ttk.Label(logwrap, text="Activity", font=FONT_B, foreground=MUTED).pack(anchor="w", pady=(0, 6))
         self.log = tk.Text(logwrap, font=MONO, relief="flat", wrap="word",
                            padx=12, pady=10, borderwidth=0,
@@ -3330,7 +3676,7 @@ class App(tk.Tk):
             invites = pending_invitations()
         except Exception:
             return
-        self.after(0, lambda: self._account_ready(invites))
+        self.post(lambda: self._account_ready(invites))
 
     def _account_ready(self, invites):
         """Main-thread half of the probe: save what was learned and show it."""
@@ -3356,7 +3702,9 @@ class App(tk.Tk):
             self._invite_watchers.remove(callback)
 
     def _set_invitations(self, invites):
-        self._invitations = list(invites or [])
+        if invites is None:
+            return          # could not ask - keep showing what we last knew
+        self._invitations = list(invites)
         # The two faces of the same news: a number on the join button of the
         # first screen, and the button inside a project - so it is seen from
         # wherever the person happens to be sitting.
@@ -3386,16 +3734,32 @@ class App(tk.Tk):
             self._set_invitations([i for i in self._invitations
                                    if i.get("id") != invitation_id])
             self.refresh_invitations()
-        self.after(0, apply)
+        self.post(apply)
 
-    def refresh_invitations(self):
-        """Ask GitHub again, off the main thread, and tell everyone watching."""
+    def refresh_invitations(self, force=False):
+        """Ask GitHub again, off the main thread, and tell everyone watching.
+
+        `force` skips the conditional request. Opening the requests window
+        forces one: that is the moment somebody is actually looking, and it is
+        the moment a stale cached answer would be most visibly wrong - which is
+        exactly how round 7 found it, the badge saying 2 while the list that
+        opened underneath it held 3.
+        """
         def work():
             try:
-                invites = pending_invitations()
-            except Exception:
+                invites = pending_invitations(force=force)
+            except Exception as exc:
+                # Network trouble is already handled inside, which returns
+                # None; anything reaching here is a fault in this program, and
+                # swallowing it makes a broken poll look exactly like a poll
+                # that found nothing - silently, for as long as the app is
+                # open. Say it once rather than crash the thread.
+                if not getattr(self, "_invite_fault", None):
+                    self._invite_fault = True
+                    self.lines.put(f"the invitation check is failing: {exc}")
                 return
-            self.after(0, lambda: self._set_invitations(invites))
+            self._invite_fault = False
+            self.post(lambda: self._set_invitations(invites))
         threading.Thread(target=work, daemon=True).start()
 
     def _invite_tick(self):
@@ -3407,6 +3771,45 @@ class App(tk.Tk):
 
     def _show_conflicts(self):
         ConflictReportsWindow(self, self)
+
+    def refresh_destructive(self):
+        """Light the button when something is being held, and only then.
+
+        Read on the main thread with plain git calls, like the other project
+        readers. It is bounded work - only files already modified or missing
+        are examined - and it runs on the same tick as the rest of the panel.
+        """
+        if not self.repo or not os.path.isdir(self.repo):
+            return
+        try:
+            changes = destructive_changes(self.repo)
+        except Exception:
+            return                       # a half-written tree is not an alarm
+        held = list(changes.get("deleted", [])) + list(changes.get("reverted", []))
+        try:
+            approved = git(self.repo, "config", "--local", "--get",
+                           "teamsync.destructiveok").strip()
+        except Exception:
+            approved = ""
+        # Already confirmed is not "waiting for you" - the button must not sit
+        # lit after the person has answered.
+        if held and approved and approved == destructive_signature(changes):
+            held = []
+        self._destructive = changes if held else {"deleted": [], "reverted": []}
+        if held:
+            self.btn_destructive.configure(text="Needs your OK (%d)" % len(held))
+            self.btn_destructive.state(["!disabled"])
+        else:
+            self.btn_destructive.configure(text="Needs your OK")
+            self.btn_destructive.state(["disabled"])
+
+    def _show_destructive(self):
+        changes = getattr(self, "_destructive", None)
+        if not changes or not (changes.get("deleted") or changes.get("reverted")):
+            messagebox.showinfo("Nothing is held",
+                                "Nothing is waiting for your word right now.", parent=self)
+            return
+        DestructiveWindow(self, self, changes)
 
     def _add_people(self, repo=None):
         """Invite people to ONE project - the open one, or one chosen first."""
@@ -3432,6 +3835,9 @@ class App(tk.Tk):
         AddPeopleWindow(self, self, repo=target)
 
     def _open_requests(self):
+        # Ask outright, not conditionally. Somebody is looking now, and a
+        # cached answer that has gone stale is worst at exactly this moment.
+        self.refresh_invitations(force=True)
         RequestsWindow(self, self, lambda inv: self._setup("friend", invite=inv))
 
     def _join(self):
@@ -3530,7 +3936,24 @@ class App(tk.Tk):
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def post(self, fn):
+        """Run fn on the main thread. Safe to call from any thread."""
+        self._jobs.put(fn)
+
+    def _run_jobs(self):
+        """Whatever the background threads handed back, run here."""
+        while True:
+            try:
+                job = self._jobs.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                job()
+            except Exception:
+                pass          # one bad hand-off must not stop the rest
+
     def _drain(self):
+        self._run_jobs()
         while True:
             try:
                 line = self.lines.get_nowait()
@@ -4166,6 +4589,10 @@ class App(tk.Tk):
 
     def _refresh_partner(self):
         """Who is here: green now, grey earlier, and nobody named twice."""
+        # Held destructive changes ride the same tick. The engine has already
+        # refused to publish them; without this the person would only learn it
+        # from the log, which is the one place a paused publish is easy to miss.
+        self.refresh_destructive()
         me = my_own_names(self.repo)
         self._team_people = team_presence(self.repo, me)
         # Only asked for when it could change the answer - the ranking exists
@@ -4176,36 +4603,56 @@ class App(tk.Tk):
                                else {})
         self.team.set(self._team_people, self._team_activity)
 
-        # A conflict somebody else is untangling outranks "working on": it is
-        # the one file where another change from here makes their job harder
-        # and probably causes the next conflict. Their repository is fine and
-        # nothing is blocked - this is knowledge, not a lock.
-        stuck = team_conflicts(self.repo, me)
-        if stuck:
-            lines = []
-            for who, files in stuck.items():
-                shown = ", ".join(files[:2]) + (" +%d" % (len(files) - 2) if len(files) > 2 else "")
-                lines.append("%s is resolving a conflict in %s" % (who, shown))
-            self.partner_files_lbl.config(text=latin(" · ".join(lines)), foreground=BAD)
-            self.partner_files_lbl.pack(anchor="e", after=self.team.master)
-            return
+        # Everything that is TRUE RIGHT NOW goes into the column, one row per
+        # person. Conflicts first: a file somebody is untangling is the one
+        # file where another change from here makes their job harder and
+        # probably causes the next conflict. Their repository is fine and
+        # nothing is blocked - this is knowledge, not a lock. Then who is
+        # holding what, named per person rather than pooled: with two people
+        # "somebody is editing this" could only mean one person, and with five
+        # it answers a question nobody asked.
+        rows = []
+        for who, files in team_conflicts(self.repo, me).items():
+            rows.append((BAD, "%s is resolving a conflict" % who, files))
+        for who, files in team_pending_files(self.repo, me).items():
+            rows.append((WARN, "%s is working on" % who, files))
+        held = getattr(self, "_destructive", None) or {}
+        n_held = len(held.get("deleted", [])) + len(held.get("reverted", []))
+        if n_held:
+            rows.append((BAD, "waiting for your word",
+                         held.get("deleted", []) + held.get("reverted", [])))
+        self._set_now(rows)
 
-        # Named per person, not pooled. With two people "someone is editing
-        # this" could only mean one person; with five it answers a question
-        # nobody asked.
-        busy = team_pending_files(self.repo, me)
-        if busy:
-            lines = []
-            for who, files in busy.items():
-                shown = ", ".join(files[:2]) + (" +%d" % (len(files) - 2) if len(files) > 2 else "")
-                lines.append("%s is working on %s" % (who, shown))
-            text = " · ".join(lines[:2])
-            if len(lines) > 2:
-                text += " · +%d more" % (len(lines) - 2)
-            self.partner_files_lbl.config(text=latin(text), foreground=WARN)
-            self.partner_files_lbl.pack(anchor="e", after=self.team.master)
-        else:
-            self.partner_files_lbl.pack_forget()
+    def _set_now(self, rows):
+        """Paint the 'Right now' column. Rebuilt only when it really changed.
+
+        Tk has to destroy and recreate these widgets to redraw them, and this
+        runs on the same tick as the rest of the panel - so a project where
+        nothing is happening, which is most of the time, must cost nothing.
+        """
+        signature = repr(rows)
+        if signature == self._now_signature:
+            return
+        self._now_signature = signature
+        for child in self.nowarea.inner.winfo_children():
+            child.destroy()
+        if not rows:
+            ttk.Label(self.nowarea.inner, text="nobody is holding anything",
+                      font=FONT, foreground=MUTED, wraplength=260,
+                      justify="left").pack(anchor="w")
+            return
+        for colour, title, files in rows:
+            block = ttk.Frame(self.nowarea.inner)
+            block.pack(fill="x", anchor="w", pady=(0, 8))
+            ttk.Label(block, text=latin(title), font=("Segoe UI", 9, "bold"),
+                      foreground=colour, wraplength=260,
+                      justify="left").pack(anchor="w")
+            # Every file, not a truncated run-on: the column has room to go
+            # down, which is the whole reason it exists.
+            for f in files:
+                ttk.Label(block, text=latin("  " + f), font=MONO,
+                          foreground=MUTED, wraplength=250,
+                          justify="left").pack(anchor="w")
 
     def _check_home(self):
         """Where the exe happens to sit should not decide whether it works."""

@@ -41,7 +41,9 @@ foreach ($r in @(git for-each-ref --format='%(refname)' 'refs/teamsync/presence'
     # -ceq: git's ref store is case-sensitive, so a teammate whose name
     # differs from mine only in case is a different person, not me.
     if ($p[3] -ceq $me) { continue }
-    $ts = 0; [void][long]::TryParse($p[4], [ref]$ts)
+    # The timestamp is the LAST segment: newer refs carry the machine in
+    # between, older ones do not, and this reads both.
+    $ts = 0; [void][long]::TryParse($p[-1], [ref]$ts)
     if (-not $seen.ContainsKey($p[3]) -or $ts -gt $seen[$p[3]]) { $seen[$p[3]] = $ts }
 }
 
@@ -71,8 +73,9 @@ if ($seen.Count -eq 0) {
 $pending = @{}
 foreach ($r in @(git for-each-ref --format='%(refname)' 'refs/teamsync/pending' 2>$null)) {
     $p = $r -split '/'
+    # The file is the LAST segment: newer refs carry the machine in between.
     if ($p.Count -lt 5) { continue }
-    $path = FromHex $p[4]
+    $path = FromHex $p[-1]
     if (-not $path) { continue }
     if (-not $pending.ContainsKey($p[3])) { $pending[$p[3]] = @() }
     $pending[$p[3]] += $path
@@ -92,10 +95,10 @@ foreach ($f in @(git diff --name-only 'origin/main...HEAD' 2>$null)) { if ($f) {
 # makes their job harder and is the usual way the NEXT conflict gets made.
 $stuck = @{}
 foreach ($r in @(git for-each-ref --format='%(refname)' 'refs/teamsync/conflict' 2>$null)) {
-    $p = $r -split '/', 5
+    $p = $r -split '/'
     if ($p.Count -lt 5) { continue }
     if ($p[3] -ceq $me) { continue }
-    $path = FromHex $p[4]
+    $path = FromHex $p[-1]
     if (-not $path) { continue }
     if (-not $stuck.ContainsKey($p[3])) { $stuck[$p[3]] = @() }
     $stuck[$p[3]] += $path

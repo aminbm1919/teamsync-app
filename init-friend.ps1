@@ -6,14 +6,18 @@
 # Never  : creates anything on GitHub. It only joins what already exists.
 #
 # Usage:
-#   pwsh init-friend.ps1 -RepoName my-project -Owner aminbm1919 -Path "C:\work\my-project"
+#   pwsh init-friend.ps1 -RepoName my-project -Owner their-github-name -Path "C:\work\my-project"
 #
 # Accept the GitHub invitation FIRST. Until you do, this fails with
 # "repository not found", which looks like a typo but is not.
 
 param(
     [Parameter(Mandatory = $true)][string]$RepoName,
-    [string]$Owner = 'aminbm1919',
+    # Whose account the project lives on. Required, and deliberately without a
+    # default: it once carried this author's own username, which was invisible
+    # here and wrong for everybody else who cloned the public source - they
+    # would have been sent to a stranger's account with no idea why.
+    [Parameter(Mandatory = $true)][string]$Owner,
     [string]$Path,
     [string]$Me,
     [string]$MyEmail,

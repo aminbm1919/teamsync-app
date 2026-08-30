@@ -12,6 +12,8 @@ function Initialize-SyncCore {
     )
     $script:SC_Repo         = $Repo
     $script:SC_AppVersion   = $AppVersion
+    # Where the engine itself lives - the templates it plants sit beside it.
+    $script:SC_Home         = $PSScriptRoot
     $script:SC_Branch       = $Branch
     $script:SC_NoPopup      = [bool]$NoPopup
     $script:SC_Log          = Join-Path $Repo '.teamsync.log'
@@ -321,34 +323,42 @@ function Get-NameOwner {
 function Resolve-MyName {
     # Settle this machine's name before anything is published under it.
     #
-    # Three outcomes, and the middle one is the point:
-    #   free            - nothing to do
-    #   taken by ME     - the same GitHub account on another machine. That is
-    #                     a normal thing to do and must not be refused; the
-    #                     two just have to be tellable apart, so a number is
-    #                     added and the colleagues see "amin-2".
-    #   taken by ANOTHER account - a real collision. Refused, because the two
-    #                     would delete each other's presence and each other's
-    #                     file warnings without end.
+    # **One GitHub account, one name - however many computers it works from.**
+    # That is the owner's rule and it is the right one: the unit of
+    # collaboration is the PERSON, not the desk they happen to be sitting at.
+    # Teammates want to know that Amin is here, not which of Amin's laptops.
     #
-    # The rename is written to this project's git config, not only to the
-    # presence key, so the commit author matches too - that pairing is what
-    # attributes anybody's work to them at all.
+    # An earlier version numbered the second machine (amin, amin-2). It cost
+    # two live defects in one day - the app renaming itself on its own leftover
+    # heartbeat after a restart, and again on the single restart that crossed
+    # an upgrade - and both times a person watched themselves appear in their
+    # own team list. Machines are told apart INSIDE the ref path now, where
+    # nobody has to look at it.
     #
-    # Returns @{ Name; Action = 'ok'|'renamed'|'refused'; Owner; From }
+    # So only one thing is still refused: a different GitHub ACCOUNT already
+    # publishing under this name. Those two would delete each other's presence
+    # and each other's file warnings without end, and neither would be told.
+    #
+    # Returns @{ Name; Action = 'ok'|'refused'; Owner }
     $me = Get-PresenceName
     if (-not $me) { return @{ Name = ''; Action = 'ok' } }
-    $mine = Get-MyGitHubLogin
+    $mine  = Get-MyGitHubLogin
+    $owner = Get-NameOwner $me
 
-    # Did WE take this numbered name, and is the original free again? A rename
-    # must be able to undo itself: it is a machine's guess about another
-    # machine, and a guess that can only ever accumulate would leave somebody
-    # as name-7 for ever because of restarts nobody remembers.
+    if ($owner -and $mine -and $owner -ne $mine) {
+        return @{ Name = $me; Action = 'refused'; Owner = $owner }
+    }
+
+    # A numbered name left behind by the version that used to rename. Give it
+    # back, quietly: the person never asked for it, and leaving it would make
+    # them two people on everybody's screen for ever.
     $came = git config --local teamsync.renamedfrom 2>$null
     if ($came) {
         $came = "$came".Trim()
         $owner0 = Get-NameOwner $came
-        if ((-not $owner0 -or -not $mine -or $owner0 -eq $mine) -and -not (Test-NameBeating $came)) {
+        if (-not $owner0 -or -not $mine -or $owner0 -eq $mine) {
+            Clear-MyPresence -Name $me
+            Clear-MyPending  -Name $me
             git config user.name $came 2>$null | Out-Null
             git config --local --unset teamsync.renamedfrom 2>$null | Out-Null
             $script:SC_IdentityRef = $null
@@ -356,142 +366,172 @@ function Resolve-MyName {
         }
     }
 
-    $owner = Get-NameOwner $me
-
-    if ($owner -and $mine -and $owner -ne $mine) {
-        return @{ Name = $me; Action = 'refused'; Owner = $owner }
-    }
-    # Free, or registered to our own account. Registration is not use: this
-    # machine registered the name on its last run too. What decides is whether
-    # a beat is arriving under it RIGHT NOW from somewhere that is not us -
-    # judging by registration instead would bump the number on every restart,
-    # for ever.
-    if (-not (Test-NameBeating $me)) { return @{ Name = $me; Action = 'ok' } }
-
-    for ($n = 2; $n -lt 100; $n++) {
-        $try = "$me-$n"
-        $who = Get-NameOwner $try
-        if ($who -and $mine -and $who -ne $mine) { continue }   # somebody else's
-        if (Test-NameBeating $try) { continue }                 # a live machine of ours
-        git config user.name $try 2>$null | Out-Null
-        # Remember where we came from, so this can be given back when the
-        # original name falls quiet again.
-        git config --local teamsync.renamedfrom $me 2>$null | Out-Null
-        $script:SC_IdentityRef = $null
-        return @{ Name = $try; Action = 'renamed'; From = $me }
-    }
     return @{ Name = $me; Action = 'ok' }
 }
 
-function Get-MyLastPresenceRef {
-    # The last beat THIS machine published, remembered across restarts.
+function Clear-MyPresence {
+    # Every presence beat this MACHINE has under a name. Other machines of the
+    # same person publish under the same name and must not be touched - which
+    # is exactly why the machine is in the ref path.
+    param([string]$Name)
+    $mid = Get-MachineId
+    foreach ($line in @(git ls-remote origin "refs/teamsync/presence/$Name/*" 2>$null)) {
+        $r = ($line -split "`t")[-1]
+        if (-not $r) { continue }
+        $b = Split-PresenceRef $r
+        # An unlabelled beat was written before machines were recorded. Under
+        # a name we are abandoning it can only be ours.
+        if ($b -and ($b.Machine -eq $mid -or -not $b.Machine)) {
+            git push -q origin ":$r" 2>$null | Out-Null
+        }
+    }
+}
+
+function Clear-MyPending {
+    param([string]$Name)
+    $mid = Get-MachineId
+    foreach ($ns in 'pending', 'conflict') {
+        foreach ($line in @(git ls-remote origin "refs/teamsync/$ns/$Name/*" 2>$null)) {
+            $r = ($line -split "`t")[-1]
+            if (-not $r) { continue }
+            $p = $r -split '/'
+            # <ns>/<name>/<machine>/<hex> is 6 parts; the older <ns>/<name>/<hex>
+            # is 5 and can only be ours under a name we are giving up.
+            if ($p.Count -lt 6 -or $p[4] -eq $mid) {
+                git push -q origin ":$r" 2>$null | Out-Null
+            }
+        }
+    }
+}
+
+function Get-MachineId {
+    # A stable token for THIS clone on THIS machine, kept in the project's
+    # local git config, which never travels.
     #
-    # In memory alone it was useless for the question it exists to answer: a
-    # restart forgets it, and the beat the previous run left behind - still
-    # fresh, because it stopped seconds ago - then looks like a second machine
-    # of ours. The app renamed itself to name-2 on its own restart and the
-    # person watched themselves appear in the team list as a stranger.
+    # Remembering "the last beat I published" was not enough, and the gap was
+    # exactly one restart wide: the first start after an upgrade has no
+    # memory yet, while the beat the previous version left behind is still
+    # live - so the app renamed itself on its own shadow anyway. A beat that
+    # SAYS which machine wrote it needs no memory at all.
+    $id = git config --local teamsync.machine 2>$null
+    if ($id) { return "$id".Trim() }
+    $id = [Guid]::NewGuid().ToString('N').Substring(0, 12)
+    git config --local teamsync.machine $id 2>$null | Out-Null
+    return $id
+}
+
+function Split-PresenceRef {
+    # refs/teamsync/presence/<name>/<machine>/<ts>   (this version)
+    # refs/teamsync/presence/<name>/<ts>             (before it)
     #
-    # Kept in the project's own git config, which is local to this clone and
-    # never travels.
-    if ($script:SC_MyPresenceRef) { return $script:SC_MyPresenceRef }
-    $v = git config --local teamsync.lastpresence 2>$null
-    if ($v) { return "$v".Trim() }
-    return ''
+    # The timestamp is the LAST segment in both shapes, which is what lets
+    # one reader serve a team that is mid-upgrade. The machine is present
+    # only in the new shape; '' means "written by a version that could not
+    # say".
+    param([string]$Ref)
+    $p = $Ref -split '/'
+    if ($p.Count -lt 5) { return $null }
+    $ts = 0
+    [void][long]::TryParse($p[-1], [ref]$ts)
+    if ($ts -le 0) { return $null }
+    @{ Name = $p[3]; Machine = $(if ($p.Count -ge 6) { $p[4] } else { '' }); Ts = $ts }
 }
 
 function Set-MyLastPresenceRef {
     param([string]$Ref)
     $script:SC_MyPresenceRef = $Ref
-    if ($Ref) { git config --local teamsync.lastpresence $Ref 2>$null | Out-Null }
-    else { git config --local --unset teamsync.lastpresence 2>$null | Out-Null }
-}
-
-function Test-NameBeating {
-    # Is a presence beat arriving under this name right now, from a machine
-    # that is not this one?
-    param([string]$Name)
-    $now  = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $mine = Get-MyLastPresenceRef
-    foreach ($line in @(git ls-remote origin "refs/teamsync/presence/$Name/*" 2>$null)) {
-        $ref = ($line -split "`t")[-1]
-        if (-not $ref -or $ref -eq $mine) { continue }
-        $parts = $ref -split '/'
-        if ($parts.Count -lt 5) { continue }
-        $ts = 0
-        [void][long]::TryParse($parts[4], [ref]$ts)
-        if (($now - $ts) -le 150) { return $true }
-    }
-    return $false
-}
-
-function Test-NameCollision {
-    # Is somebody else already publishing under our name?
-    #
-    # Every ref this engine owns is keyed on the sanitised git user.name, and
-    # each engine treats that whole namespace as its own property: the
-    # first-beat sweep deletes every presence ref under our name, and the
-    # pending reconcile deletes every announcement under it that we do not
-    # ourselves want. Two people who resolve to the same name - two who left
-    # it at "User", or "amin" and "Amin" - therefore delete each other's
-    # heartbeats and each other's file announcements, forever. The collision
-    # warning would be silently switched off for exactly the pair most likely
-    # to collide, and nothing would ever say so.
-    #
-    # Compared case-INSENSITIVELY on purpose, unlike the "is this mine?"
-    # checks elsewhere: on Windows the ref store folds case, so 'amin' and
-    # 'Amin' would land in one directory even though git's ref names are
-    # case-sensitive in principle. Two names that differ only in case are a
-    # collision here whether or not git thinks so.
-    #
-    # Returns the colliding name, or '' when the coast is clear.
-    $me = Get-PresenceName
-    if (-not $me) { return '' }
-    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $mineRef = $script:SC_MyPresenceRef
-    foreach ($line in @(git ls-remote origin 'refs/teamsync/presence/*' 2>$null)) {
-        $ref = ($line -split "`t")[-1]
-        if (-not $ref -or $ref -eq $mineRef) { continue }
-        $parts = $ref -split '/'
-        if ($parts.Count -lt 5) { continue }
-        $who = $parts[3]
-        if ($who -cne $me -and $who -eq $me) {
-            # differs only in case: still one directory on this filesystem
-            return $who
-        }
-        if ($who -cne $me) { continue }
-        # Same spelling exactly. It is ours only if it is a beat we published
-        # in this run; anything else fresh belongs to somebody else.
-        $ts = 0
-        [void][long]::TryParse($parts[4], [ref]$ts)
-        if (($now - $ts) -le 150) { return $who }
-    }
-    return ''
 }
 
 function Publish-Presence {
     $me = Get-PresenceName
     if (-not $me) { return }
     $ts  = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $new = "refs/teamsync/presence/$me/$ts"
+    # The machine goes IN the ref, so nobody has to remember whose beat it is.
+    $new = "refs/teamsync/presence/$me/$(Get-MachineId)/$ts"
     $old = $script:SC_MyPresenceRef
 
     git push -q origin "HEAD:$new" 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { return }          # offline; try again next tick
     Set-MyLastPresenceRef $new
 
-    if ($old) {
+    if ($old -and $old -ne $new) {
         # Drop the previous beat separately, so its failure cannot cancel the new one.
-        if ($old -ne $new) { git push -q origin ":$old" 2>$null | Out-Null }
-    } else {
-        # First beat of this run. A run that was killed (window closed, machine
-        # powered off) never got to tidy up, so its last beat is still on the
-        # server. Sweep every beat of ours except the one just published,
-        # otherwise they pile up one per restart, forever.
-        $mine = @(git ls-remote origin "refs/teamsync/presence/$me/*" 2>$null |
-                  ForEach-Object { ($_ -split "`t")[-1] } |
-                  Where-Object { $_ -and $_ -ne $new })
-        foreach ($r in $mine) { git push -q origin ":$r" 2>$null | Out-Null }
+        git push -q origin ":$old" 2>$null | Out-Null
+    }
+
+    if (-not $script:SC_SweptThisRun) {
+        # First beat of this RUN - and it must be judged by the run, not by
+        # whether a previous beat is remembered. Since 2.1.1 the last beat is
+        # kept in git config so it survives a restart, which quietly meant this
+        # sweep stopped running at all: the pile-up it exists to prevent was
+        # being remembered rather than cleaned.
+        $script:SC_SweptThisRun = $true
+        Clear-DeadBeats -Keep $new -Now $ts
+    }
+}
+
+function Get-MyOwnNames {
+    # Every name THIS ACCOUNT has registered, from the identity refs on the
+    # server. The local config cannot know a name retired on an earlier
+    # install, or one an older version invented for a machine that never
+    # existed - but that name still carries our login on the wire.
+    $me = Get-PresenceName
+    $names = @{}
+    if ($me) { $names[$me] = $true }
+    $login = Get-MyGitHubLogin
+    if ($login) {
+        foreach ($line in @(git ls-remote origin "refs/teamsync/identity/*" 2>$null)) {
+            $r = ($line -split "`t")[-1]
+            if (-not $r) { continue }
+            $p = $r -split '/'
+            # refs/teamsync/identity/<name>/<login>
+            if ($p.Count -lt 5) { continue }
+            if ($p[4] -ceq $login) { $names[$p[3]] = $true }
+        }
+    }
+    return @($names.Keys)
+}
+
+function Clear-DeadBeats {
+    # Remove heartbeats that belong to this account and cannot be alive.
+    #
+    # A run that was killed - window closed, machine powered off - never tidied
+    # up, so its last beat is still there. Nothing else will ever remove it:
+    # each engine sweeps only what it recognises as its own, so a beat under a
+    # name nobody uses any more is orphaned for good and every reader goes on
+    # listing it as a person. Measured on the user's own screen: "amin-2",
+    # a name no machine had ever really used, still shown as a teammate.
+    param([string]$Keep, [long]$Now)
+    $mid = Get-MachineId
+    $me  = Get-PresenceName
+    foreach ($name in (Get-MyOwnNames)) {
+        $survivors = 0
+        foreach ($line in @(git ls-remote origin "refs/teamsync/presence/$name/*" 2>$null)) {
+            $r = ($line -split "`t")[-1]
+            if (-not $r) { continue }
+            if ($r -eq $Keep) { $survivors++; continue }
+            $b = Split-PresenceRef $r
+            if (-not $b) { $survivors++; continue }
+            # This machine's own leftovers go without question. Everything else
+            # must be STALE first: a fresh beat under one of our other names
+            # could be a second computer of ours still on an old build, and
+            # deleting it would make that machine vanish from the team.
+            $isMine  = ($b.Machine -ceq $mid)
+            $isStale = (($Now - $b.Ts) -gt 150)
+            if ($isMine -or $isStale) {
+                git push -q origin ":$r" 2>$null | Out-Null
+                if ($LASTEXITCODE -ne 0) { $survivors++ }
+            } else {
+                $survivors++
+            }
+        }
+        # The retired name's registration goes too - but ONLY once nothing is
+        # left beating under it. That ref is what tells every reader the name
+        # is ours; dropping it while a beat survives would turn that beat back
+        # into a stranger, which is the exact bug this is here to end.
+        if ($name -cne $me -and $survivors -eq 0) {
+            git push -q origin ":refs/teamsync/identity/$name/$(Get-MyGitHubLogin)" 2>$null | Out-Null
+        }
     }
 }
 
@@ -595,14 +635,21 @@ function Publish-Pending {
     $me = Get-PresenceName
     if (-not $me) { return }
 
+    $mid = Get-MachineId
     $want = @{}
-    # Pending work AND files simply open in the editor: the partner should see
+    # Pending work AND files simply open in the editor: teammates should see
     # "hands on this file" from the moment of opening, not the first save.
+    #
+    # The MACHINE is in the path. One person may work from two computers under
+    # one name, and this reconcile deletes every ref under its own prefix that
+    # it does not itself want - so without the machine segment, their desk
+    # would erase their laptop's announcements every minute, and each machine
+    # would leave the other's files unguarded.
     $announce = @(Get-PendingFiles) + @((Get-EditorReport).Open) | Sort-Object -Unique
-    foreach ($f in $announce) { $want["refs/teamsync/pending/$me/$(ConvertTo-RefHex $f)"] = $true }
+    foreach ($f in $announce) { $want["refs/teamsync/pending/$me/$mid/$(ConvertTo-RefHex $f)"] = $true }
 
     $have = @{}
-    foreach ($line in @(git ls-remote origin "refs/teamsync/pending/$me/*" 2>$null)) {
+    foreach ($line in @(git ls-remote origin "refs/teamsync/pending/$me/$mid/*" 2>$null)) {
         $r = ($line -split "`t")[-1]
         if ($r) { $have[$r] = $true }
     }
@@ -638,17 +685,21 @@ function Publish-Pending {
 #
 # So it travels the same way presence and pending do - as refs, costing no
 # commits:
-#   refs/teamsync/conflict/<name>/<path-as-hex>
+#   refs/teamsync/conflict/<name>/<machine>/<path-as-hex>
+#
+# The machine is in the path for the same reason it is in the pending refs: a
+# conflict happens on ONE computer, and a person may have two under one name.
 
 function Publish-Conflict {
     param([string[]]$Files)
     $me = Get-PresenceName
     if (-not $me) { return }
+    $mid = Get-MachineId
     $want = @{}
-    foreach ($f in $Files) { if ($f) { $want["refs/teamsync/conflict/$me/$(ConvertTo-RefHex $f)"] = $true } }
+    foreach ($f in $Files) { if ($f) { $want["refs/teamsync/conflict/$me/$mid/$(ConvertTo-RefHex $f)"] = $true } }
 
     $have = @{}
-    foreach ($line in @(git ls-remote origin "refs/teamsync/conflict/$me/*" 2>$null)) {
+    foreach ($line in @(git ls-remote origin "refs/teamsync/conflict/$me/$mid/*" 2>$null)) {
         $r = ($line -split "`t")[-1]
         if ($r) { $have[$r] = $true }
     }
@@ -709,15 +760,21 @@ function Clear-Volunteers {
 }
 
 function Get-TeamConflicts {
-    # @{ name = @(paths) } for everyone who is not us.
+    # @{ name = @(paths) } for every PERSON who is not us.
+    #
+    # By NAME, not by machine - unlike the pending warnings. A conflict is
+    # already readable and resolvable by everybody through the Conflicts
+    # window, so there is nothing here for one's own other machine to add;
+    # and the app shows one's OWN conflict from the local unmerged files
+    # already, so filtering by machine would only make it appear twice.
     $me  = Get-PresenceName
     $out = @{}
     foreach ($line in @(git for-each-ref --format='%(refname)' 'refs/teamsync/conflict' 2>$null)) {
-        $parts = $line -split '/', 5
+        $parts = $line -split '/'
         if ($parts.Count -lt 5) { continue }
         $who = $parts[3]
         if ($who -ceq $me) { continue }
-        $p = ConvertFrom-RefHex $parts[4]
+        $p = ConvertFrom-RefHex $parts[-1]
         if (-not $p) { continue }
         if (-not $out.ContainsKey($who)) { $out[$who] = @() }
         $out[$who] += $p
@@ -732,21 +789,34 @@ function Sync-PendingRefs {
 }
 
 function Get-PartnerPending {
-    # @{ name = @(paths) } for everyone who is not us.
+    # @{ name = @(paths) } for every PERSON who is not us - all of our own
+    # machines included in "us".
     $me  = Get-PresenceName
     $out = @{}
     foreach ($line in @(git for-each-ref --format='%(refname)' 'refs/teamsync/pending' 2>$null)) {
         $parts = $line -split '/'
         if ($parts.Count -lt 5) { continue }
         $who = $parts[3]
-        # -cne, not -ne: PowerShell's plain comparison ignores case, so
-        # 'Ali-Reza' -eq 'ali-reza' is True. Git's ref store does not ignore
-        # case, so those are two real people - and the loose comparison threw
-        # away every announcement belonging to the second of them, as if it
-        # were our own. With two people the names were distinct by luck; with
-        # a team it is a matter of time.
+        # Skip our own NAME - which means all of our own machines.
+        #
+        # A person's computers are ONE identity here, merged as far as they
+        # can be, so that work started on one is picked up on another. Warning
+        # somebody about a file they themselves have open elsewhere is not
+        # safety, it is noise: there is only one head editing both, and it
+        # already knows.
+        #
+        # The machine still appears IN the ref path, but only so the two do
+        # not delete each other's announcements during the reconcile - never
+        # to make them strangers.
+        #
+        # -ceq, not -eq: PowerShell's plain comparison ignores case, so
+        # 'Ali-Reza' -eq 'ali-reza' is True while git's ref store treats them
+        # as two real people.
         if ($who -ceq $me) { continue }
-        $path = ConvertFrom-RefHex $parts[4]
+        # The file is the LAST segment. Newer refs carry the machine in
+        # between, and reading position 4 would decode the machine id as a
+        # filename.
+        $path = ConvertFrom-RefHex $parts[-1]
         if (-not $path) { continue }
         if (-not $out.ContainsKey($who)) { $out[$who] = @() }
         $out[$who] += $path
@@ -771,6 +841,70 @@ function Test-Rebasing {
 
 function Get-Unmerged { @(git diff --name-only --diff-filter=U 2>$null) }
 
+function Test-RemoteBranch {
+    # Three answers, not two: 'yes' the branch is there, 'empty' the remote
+    # answered but has no such branch, 'unreachable' we could not ask.
+    #
+    # `git fetch origin main` fails for BOTH of the last two, and the engine
+    # used to read that single non-zero exit as "offline". Measured live on
+    # round 7: a machine that had just been invited to a repository with no
+    # commits reported "cannot reach GitHub" and sat retrying - while the very
+    # same engine was successfully pushing its presence refs to that very
+    # remote. The network was never the problem; the BRANCH did not exist.
+    $out = git ls-remote --heads origin $script:SC_Branch 2>$null
+    if ($LASTEXITCODE -ne 0) { return 'unreachable' }
+    if ($out) { return 'yes' }
+    return 'empty'
+}
+
+function Initialize-EmptyProject {
+    # A project whose branch does not exist yet cannot sync at all, and the
+    # engine used to make it worse: with no .gitignore in place it committed
+    # and ANNOUNCED its own bookkeeping - the live run published
+    # refs/teamsync/pending/.../.teamsync.lock and .teamsync.log as work in
+    # progress.
+    #
+    # So: put the ignore rules in first, whatever else happens. Then, only if
+    # there is real content to send, publish it and create the branch. An empty
+    # folder deliberately does NOT create one - two machines each starting
+    # their own first commit would give the project two unrelated histories,
+    # which is far worse than waiting for the person who set it up.
+    $ignore = Join-Path $script:SC_Repo '.gitignore'
+    $needed = @('.teamsync*', '_conflicts/')
+    $have   = @()
+    if (Test-Path -LiteralPath $ignore) {
+        $have = @([IO.File]::ReadAllText($ignore) -split "`r?`n")
+    }
+    $add = @($needed | Where-Object { $have -notcontains $_ })
+    if ($add.Count -gt 0) {
+        $text = (($have + $add) | Where-Object { $_ -ne '' }) -join "`r`n"
+        [IO.File]::WriteAllText($ignore, $text + "`r`n", (New-Object Text.UTF8Encoding($false)))
+        Write-Log 'this project had no .gitignore - added the sync rules so the engine stops announcing its own files' 'Yellow'
+    }
+
+    # Anything real to publish? The ignore file alone counts: it is the seed
+    # every clone needs, and it is not the engine talking about itself.
+    git add -A 2>$null | Out-Null
+    $staged = @(git diff --cached --name-only 2>$null)
+    if ($staged.Count -eq 0 -and -not (git rev-parse --verify -q HEAD 2>$null)) {
+        Write-Log "this project has no '$($script:SC_Branch)' branch yet - waiting for its first version" 'Yellow'
+        return $false
+    }
+    if ($staged.Count -gt 0) {
+        git commit -q -m "sync: first version $(Get-Date -Format 'MM-dd HH:mm:ss')" 2>$null | Out-Null
+    }
+    git push -q origin "HEAD:$($script:SC_Branch)" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        # Somebody created it in the meantime. Do NOT force: take theirs.
+        Write-Log "another machine created '$($script:SC_Branch)' first - taking their version" 'Cyan'
+        git fetch -q origin $script:SC_Branch 2>$null | Out-Null
+        return $false
+    }
+    git branch --set-upstream-to "origin/$($script:SC_Branch)" 2>$null | Out-Null
+    Write-Log "started this project: created '$($script:SC_Branch)' and published the first version" 'Green'
+    return $true
+}
+
 function Get-AheadCount  { $n = git rev-list --count "origin/$($script:SC_Branch)..HEAD" 2>$null; if ($n) { [int]$n } else { 0 } }
 function Get-BehindCount { $n = git rev-list --count "HEAD..origin/$($script:SC_Branch)" 2>$null; if ($n) { [int]$n } else { 0 } }
 
@@ -780,6 +914,216 @@ function Invoke-CommitLocal {
     if (@(git diff --cached --name-only 2>$null).Count -eq 0) { return $false }
     git commit -q -m "sync: $(Get-Date -Format 'MM-dd HH:mm:ss')" 2>$null | Out-Null
     return $true
+}
+
+# The files this app plants inside a project. ONE list, because keeping three
+# of them in step by hand had already failed twice: working.template.ps1 was
+# missing from the BUILD's bundle entirely, so every project created by the
+# packaged app silently never received working.ps1 at all - and the agent
+# announcement, which the whole read-side hold depends on, had nothing to run.
+# Update-PlantedFiles refreshes exactly this list, and build.ps1 refuses to
+# build unless every entry is inside the package.
+$SC_Planted = @(
+    @{ Src = 'push-now.template.ps1';     Dst = 'push-now.ps1' }
+    @{ Src = 'working.template.ps1';      Dst = 'working.ps1'  }
+    @{ Src = 'who.template.ps1';          Dst = 'who.ps1'      }
+    @{ Src = 'TEAM-PROJECT-REFERENCE.md'; Dst = 'TEAM-PROJECT-REFERENCE.md' }
+)
+
+function ConvertTo-VersionNumber {
+    # "2.1.6" -> 2001006, so versions compare as plain numbers. Each part is
+    # capped at three digits, which the project's own version rule guarantees:
+    # only the first part may pass 9.
+    param([string]$Text)
+    if (-not $Text) { return 0 }
+    $p = ($Text.Trim().TrimStart('v', 'V') -split '\.')
+    if ($p.Count -lt 3) { return 0 }
+    $n = 0
+    foreach ($x in $p[0..2]) {
+        $v = 0
+        if (-not [int]::TryParse($x, [ref]$v)) { return 0 }
+        $n = $n * 1000 + $v
+    }
+    return $n
+}
+
+function Update-PlantedFiles {
+    # The app updates itself. The things it PLANTED did not.
+    #
+    # who.ps1, working.ps1, push-now.ps1 and TEAM-PROJECT-REFERENCE.md are
+    # copied into a project once, by init-owner, and nothing ever refreshed
+    # them. Measured on a real project a week old: push-now.ps1 was 5,868 bytes
+    # against a shipped 11,358 - nearly half the script missing, including the
+    # whole guard that stops a deletion being published. So a safety feature
+    # shipped one day protected only projects created the next.
+    #
+    # The reference is worse than the scripts, because it is what the AGENTS
+    # read: a copy two versions behind teaches rules that no longer hold.
+    #
+    # These files are TRACKED IN GIT, so one machine refreshing them carries
+    # the fix to everybody. That is also the danger: two machines on different
+    # app versions would otherwise overwrite each other every startup, for
+    # ever. So each planted file carries a stamp of the version that wrote it,
+    # and an older app leaves a newer file alone.
+    param([string]$AppVersion)
+    $mine = ConvertTo-VersionNumber $AppVersion
+    if ($mine -le 0) { return @() }
+
+    $marks = @{ '.ps1' = '# teamsync-artifact-version: '
+                '.md'  = '<!-- teamsync-artifact-version: ' }
+
+    $changed = @()
+    foreach ($item in $SC_Planted) {
+        $src = @(
+            (Join-Path $script:SC_Home $item.Src)
+            (Join-Path $script:SC_Home "..\$($item.Src)")
+        ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+        if (-not $src) { continue }
+
+        $dstPath = Join-Path $script:SC_Repo $item.Dst
+        $ext     = [IO.Path]::GetExtension($item.Dst)
+        $mark    = $marks[$ext]
+        if (-not $mark) { continue }
+
+        $shipped = [IO.File]::ReadAllText($src)
+        $current = ''
+        $stamped = 0
+        if (Test-Path -LiteralPath $dstPath) {
+            $current = [IO.File]::ReadAllText($dstPath)
+            foreach ($line in ($current -split "`r?`n")) {
+                if ($line.StartsWith($mark)) {
+                    $stamped = ConvertTo-VersionNumber (
+                        $line.Substring($mark.Length).TrimEnd(' ', '-', '>'))
+                    break
+                }
+            }
+        }
+
+        # A machine running an older app must never drag a newer file back.
+        if ($stamped -gt $mine) { continue }
+
+        $stampLine = if ($ext -eq '.md') { "$mark$AppVersion -->" } else { "$mark$AppVersion" }
+        $wanted    = $stampLine + "`r`n" + $shipped
+
+        # Compare the BODY, ignoring the stamp.
+        $currentBody = ($current -split "`r?`n" | Where-Object { -not $_.StartsWith($mark) }) -join "`n"
+        $wantedBody  = ($shipped -split "`r?`n") -join "`n"
+
+        # Identical content AND the stamp already ours: nothing to do. This is
+        # the ordinary case on every startup, and it must cost nothing - a
+        # rewrite here would be a commit that travels to the whole team and
+        # shows up as somebody's unpublished work.
+        if ($currentBody -eq $wantedBody -and $stamped -eq $mine) { continue }
+
+        # Identical content under an OLDER stamp still gets re-stamped, once.
+        # The stamp is the only thing that stops an older app overwriting a
+        # newer file, and it is compared with -gt: leaving it behind would mean
+        # a machine whose shipped copy of this file is OLDER than what is here,
+        # but whose app version merely EQUALS the stale stamp, sails past the
+        # guard and downgrades it. One small commit per upgrade closes that.
+
+        try {
+            # UTF-8 without a byte-order mark, the same rule as every other
+            # file this engine writes - a mark at the head of a .ps1 is a
+            # parse error waiting for the first non-latin path.
+            [IO.File]::WriteAllText($dstPath, $wanted, (New-Object Text.UTF8Encoding($false)))
+            $changed += $item.Dst
+        } catch {
+            Write-Log "could not refresh $($item.Dst): $($_.Exception.Message)" 'Yellow'
+        }
+    }
+
+    if ($changed.Count -gt 0) {
+        Write-Log "refreshed from this version of the app: $($changed -join ', ')" 'Cyan'
+    }
+    return $changed
+}
+
+function Get-DestructiveChanges {
+    # What is about to leave this machine that DESTROYS work rather than adding
+    # to it. Two shapes, both measured on this engine before this existed:
+    #
+    #   deleted  - a file that IS in our history is no longer on the disk. The
+    #              publish removes it from every teammate's machine, and the
+    #              log said only "pushed 1 commit(s)".
+    #   reverted - a file whose new content is byte-identical to an OLDER
+    #              version of itself. Not a guess: the blob hash matches a
+    #              previous commit's, which is exactly what putting a backup
+    #              back looks like. It replaces newer text with older text
+    #              wherever it lands.
+    #
+    # A machine that is merely BEHIND is not destructive and must never be
+    # caught here - and it is not, because git compares the disk against THIS
+    # machine's own history, not against the server. "I never had it" and "I
+    # deleted it" are different states, which is why signing in from a second
+    # computer is safe.
+    param([int]$MaxHistory = 40)
+
+    $deleted = @()
+    foreach ($f in @(git diff --name-only --diff-filter=D HEAD 2>$null)) {
+        if ($f) { $deleted += $f }
+    }
+
+    $reverted = @()
+    foreach ($f in @(git diff --name-only --diff-filter=M HEAD 2>$null)) {
+        if (-not $f) { continue }
+        $full = Join-Path $script:SC_Repo $f
+        if (-not (Test-Path -LiteralPath $full)) { continue }
+        $now = (git hash-object -- "$full" 2>$null | Select-Object -First 1)
+        if (-not $now) { continue }
+        # Walk only this file's own history, and only so far back: the answer
+        # we want is "has this exact content been here before", and a backup
+        # older than forty edits of one file is not what anybody just restored.
+        foreach ($c in @(git rev-list -n $MaxHistory HEAD -- "$f" 2>$null)) {
+            if (-not $c) { continue }
+            $was = (git rev-parse -q --verify "${c}:$f" 2>$null | Select-Object -First 1)
+            if ($was -and $was -eq $now) { $reverted += $f; break }
+        }
+    }
+
+    return @{ Deleted = @($deleted); Reverted = @($reverted) }
+}
+
+function Get-DestructiveSignature {
+    # Identifies one particular set of destructive changes, so a confirmation
+    # covers what the person actually looked at and nothing else. Delete one
+    # more file afterwards and the signature changes, so it is asked again.
+    param($Changes)
+    # ORDINAL sort, deliberately: the window computes this same signature in
+    # Python, and PowerShell's default Sort-Object is culture-aware. Two
+    # spellings of "sorted" would make the app and the engine disagree about
+    # which accident the person confirmed - silently, and only for names where
+    # the cultures differ.
+    $all = [Collections.Generic.List[string]]@(@($Changes.Deleted) + @($Changes.Reverted))
+    if ($all.Count -eq 0) { return '' }
+    $all.Sort([StringComparer]::Ordinal)
+    $text = ($all -join "`n")
+    $sha  = [Security.Cryptography.SHA1]::Create()
+    return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($text))) -replace '-', '').Substring(0, 12)
+}
+
+function Approve-Destructive {
+    # The person said "yes, I meant it". Recorded on the disk against THIS set,
+    # so it survives a restart and cannot silently bless a later accident.
+    param($Changes)
+    git config --local teamsync.destructiveok (Get-DestructiveSignature $Changes) 2>$null | Out-Null
+}
+
+function Test-DestructiveApproved {
+    param($Changes)
+    $sig = Get-DestructiveSignature $Changes
+    if (-not $sig) { return $true }
+    return ((git config --local --get teamsync.destructiveok 2>$null) -eq $sig)
+}
+
+function Restore-Destructive {
+    # The other answer: put them back. This is the undo the app never had -
+    # every version is already in every clone, there was simply no door to it.
+    param($Changes)
+    foreach ($f in @(@($Changes.Deleted) + @($Changes.Reverted))) {
+        if ($f) { git checkout -- "$f" 2>$null | Out-Null }
+    }
+    git config --local --unset teamsync.destructiveok 2>$null | Out-Null
 }
 
 function Show-Alert {
@@ -949,8 +1293,25 @@ function Invoke-Integrate {
     # and a crossing is declared explicitly with both originals kept.
     param([switch]$AtPublish)
     git fetch -q origin $script:SC_Branch 2>$null
-    if ($LASTEXITCODE -ne 0) { Set-NetState $false; return $false }
+    if ($LASTEXITCODE -ne 0) {
+        # A failed fetch has two very different causes, and calling both
+        # "offline" is what made a newly joined empty project sit for ever
+        # saying "cannot reach GitHub" while it was demonstrably online.
+        switch (Test-RemoteBranch) {
+            'unreachable' { Set-NetState $false; return $false }
+            'empty' {
+                Set-NetState $true
+                if (-not $script:SC_SaidEmpty) {
+                    $script:SC_SaidEmpty = $true
+                    Initialize-EmptyProject | Out-Null
+                }
+                return $true          # online, nothing to integrate yet
+            }
+            default { Set-NetState $false; return $false }
+        }
+    }
     Set-NetState $true
+    $script:SC_SaidEmpty = $false
 
     $behind = Get-BehindCount
     if ($behind -eq 0) { return $true }
@@ -1093,6 +1454,34 @@ function Invoke-Publish {
     if ((Test-Rebasing) -or (Get-Unmerged).Count -gt 0) {
         Write-Log 'not publishing - a conflict is still open' 'Yellow'
         return $false
+    }
+
+    # Adding work needs no permission; destroying it does. A deletion or a
+    # reversion is published exactly like an edit - it was measured removing a
+    # file from every teammate's machine while the log said "pushed 1
+    # commit(s)" - so the machine no longer makes that call on its own.
+    $destructive = Get-DestructiveChanges
+    $script:SC_Destructive = $destructive
+    if (@($destructive.Deleted).Count -or @($destructive.Reverted).Count) {
+        if (-not (Test-DestructiveApproved $destructive)) {
+            $lines = @()
+            if (@($destructive.Deleted).Count)  { $lines += "removed: $((@($destructive.Deleted)  | Select-Object -First 12) -join ', ')" }
+            if (@($destructive.Reverted).Count) { $lines += "put back to an older version: $((@($destructive.Reverted) | Select-Object -First 12) -join ', ')" }
+            if (-not $script:SC_DestructiveSaid -or $script:SC_DestructiveSaid -ne (Get-DestructiveSignature $destructive)) {
+                $script:SC_DestructiveSaid = Get-DestructiveSignature $destructive
+                Write-Log "publishing is PAUSED - this would destroy work on everybody's machine" 'Red'
+                foreach ($l in $lines) { Write-Log "  $l" 'Yellow' }
+                Write-Log '  say so in the app, or put them back - nothing goes out until you do' 'Yellow'
+                Show-Alert -Title 'teamsync: this would delete work for everyone' -Body (
+                    "Publishing is paused.`n`n" + ($lines -join "`n") + "`n`n" +
+                    "If you meant it, confirm it in TeamSync and it goes out. " +
+                    "If it was a mistake, choose to put them back - every version " +
+                    "is still here.") -OpenFolder $script:SC_Repo
+            }
+            return $false
+        }
+    } else {
+        $script:SC_DestructiveSaid = $null
     }
 
     Invoke-CommitLocal | Out-Null

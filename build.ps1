@@ -45,8 +45,36 @@ if (-not $SkipClean) {
 Step 'Building'
 $bundled = @(
     'teamsync.ps1', 'sync-core.ps1', 'init-owner.ps1', 'init-friend.ps1',
-    'push-now.template.ps1', 'who.template.ps1', 'AGENTS.project.md'
+    'push-now.template.ps1', 'working.template.ps1', 'who.template.ps1',
+    'AGENTS.project.md'
 )
+
+# Two layouts, both real, and a file may sit in either. In the development
+# tree TEAM-PROJECT-REFERENCE.md is one level up, beside the other projects;
+# in the PUBLIC repository everything is flat, so it is right here. Resolve
+# both, always - a check that knew only the development layout would refuse to
+# build from a fresh clone, which is the one place nobody would notice until a
+# stranger tried it.
+function Resolve-Source {
+    param([string]$Name)
+    foreach ($p in @((Join-Path $PSScriptRoot $Name), (Join-Path $PSScriptRoot "..\$Name"))) {
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+    return $null
+}
+
+# Everything the engine plants into a project MUST be inside the package, and
+# this list used to be kept in step with that one by hand. It was not:
+# working.template.ps1 was absent for weeks, so the packaged app planted no
+# working.ps1 at all and the agent announcement had nothing to run - silently,
+# because a missing file makes no noise until somebody needs it. The engine
+# owns the list now; the build only checks it.
+. (Join-Path $PSScriptRoot 'sync-core.ps1')
+foreach ($item in $SC_Planted) {
+    if (($bundled -notcontains $item.Src) -and -not (Resolve-Source $item.Src)) {
+        Die "$($item.Src) is planted into projects but is not in the package. Add it to `$bundled."
+    }
+}
 $icon = Join-Path $PSScriptRoot 'ui\assets\teamsync.ico'
 if (-not (Test-Path -LiteralPath $icon)) { Die "Missing the app icon: $icon" }
 $args = @('-m', 'PyInstaller', '--noconfirm', '--onedir', '--windowed', '--name', 'TeamSync',
@@ -58,9 +86,10 @@ foreach ($f in $bundled) {
     if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $f))) { Die "Missing source file: $f" }
     $args += @('--add-data', "$f;engine")
 }
-# TEAM-PROJECT-REFERENCE.md lives one level up; the init script looks in both places.
-$ref = Join-Path $PSScriptRoot '..\TEAM-PROJECT-REFERENCE.md'
-if (Test-Path -LiteralPath $ref) { $args += @('--add-data', "$ref;engine") }
+# Beside build.ps1 in a fresh clone, one level up in the development tree.
+$ref = Resolve-Source 'TEAM-PROJECT-REFERENCE.md'
+if ($ref) { $args += @('--add-data', "$ref;engine") }
+else { Die 'TEAM-PROJECT-REFERENCE.md not found - the app would plant no rules for the agents.' }
 $args += @('--add-data', 'ui\editor-extension;editor-extension')
 $args += @('--add-data', 'ui\assets\help;assets\help')
 $args += 'ui/teamsync_ui.py'

@@ -114,16 +114,16 @@ Invoke-LogRotation
 $script:TS_LogDate = (Get-Date).Date
 Update-Heartbeat
 
-# Before publishing a single ref: is this name already taken on this project?
-# Everything the engine owns is filed under the sanitised git user.name, and
-# each engine deletes what it finds under its own name. Two people sharing
-# one name would delete each other's heartbeats and each other's file
-# announcements without end - turning OFF the collision warning for exactly
-# the pair most at risk of colliding, and saying nothing about it.
+# ONE GITHUB ACCOUNT, ONE NAME - however many computers it works from. The
+# unit of collaboration is the person, not the desk. Two machines of the same
+# person publish under the same name and are told apart inside the ref path,
+# where nobody has to look at it: online means online from EITHER of them,
+# offline means offline on both, and last-seen is the most recent of them.
 #
-# Refused rather than worked around. A generated unique key would fix the
-# refs and break the thing they are for: the sanitised name is what joins a
-# presence beat to a commit author, which is how anyone is attributed at all.
+# Only a different GitHub ACCOUNT on the same name is refused. Those two would
+# delete each other's heartbeats and each other's file announcements without
+# end - turning OFF the collision warning for exactly the pair most at risk of
+# colliding, and saying nothing about it.
 $named = Resolve-MyName
 if ($named.Action -eq 'refused') {
     Write-Host ''
@@ -140,24 +140,28 @@ if ($named.Action -eq 'refused') {
     exit 1
 }
 if ($named.Action -eq 'restored') {
+    # An earlier version numbered this machine. Undo it: the person never
+    # asked to be two people, and leaving it would keep them split on
+    # everybody's screen.
     Write-Host ''
-    Write-Host "Your other machine has gone quiet, so this one is '$($named.Name)' again." -ForegroundColor Cyan
+    Write-Host "This machine had been renamed to '$($named.From)'. It publishes as" -ForegroundColor Cyan
+    Write-Host "'$($named.Name)' again - one account, one name, however many computers." -ForegroundColor Cyan
     Write-Host ''
-    Write-Log "back to publishing as '$($named.Name)' - '$($named.From)' is no longer needed" 'Cyan'
-}
-if ($named.Action -eq 'renamed') {
-    # The SAME person, on a second machine. That is an ordinary thing to do
-    # and is not refused - the two just have to be tellable apart, so this
-    # machine takes a numbered name. Written into this project's git config,
-    # not only into the presence key, so commits carry it too.
-    Write-Host ''
-    Write-Host "You are already working here as '$($named.From)' from another machine." -ForegroundColor Cyan
-    Write-Host "This one will show up as '$($named.Name)', so your teammates can tell" -ForegroundColor Cyan
-    Write-Host 'the two apart. Nothing else changes.' -ForegroundColor Cyan
-    Write-Host ''
-    Write-Log "this machine will publish as '$($named.Name)' - '$($named.From)' is your other machine" 'Cyan'
+    Write-Log "back to publishing as '$($named.Name)' - '$($named.From)' was a rename this version does not make" 'Cyan'
 }
 Publish-Identity
+
+# Bring the files this app planted into the project up to this app's version.
+# They were copied in once by init-owner and nothing ever refreshed them, so
+# every fix since the project was created had been landing nowhere: measured
+# on a week-old project, push-now.ps1 was missing half its length including
+# the guard that stops a deletion being published, and the reference the
+# AGENTS read was two versions behind - teaching rules that no longer held.
+#
+# Done here, once per run, before any work: the scripts are what a person or
+# an agent reaches for first, and a stale one is worse than a missing one
+# because it answers.
+Update-PlantedFiles -AppVersion $AppVersion | Out-Null
 
 Invoke-Integrate | Out-Null
 Publish-Presence
@@ -290,10 +294,12 @@ try {
                 # may be overtaken by the version that lands.
                 foreach ($line in @(git for-each-ref --format='%(refname)' "refs/teamsync/volunteer/$(Get-PresenceName)" 2>$null)) {
                     # refs/teamsync/volunteer/<owner>/<hex>/<volunteer> = 6 parts
-                    $parts = $line -split '/', 6
+                    # volunteer/<owner>/<hex>/<volunteer> = 6 parts. The
+                    # volunteer is last; the path is the one before it.
+                    $parts = $line -split '/'
                     if ($parts.Count -lt 6) { continue }
-                    $p = ConvertFrom-RefHex $parts[4]
-                    $volunteer = $parts[5]
+                    $p = ConvertFrom-RefHex $parts[-2]
+                    $volunteer = $parts[-1]
                     $key = "$volunteer|$p"
                     if (-not $seenVolunteers.ContainsKey($key)) {
                         $seenVolunteers[$key] = $true

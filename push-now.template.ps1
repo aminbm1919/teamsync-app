@@ -3,7 +3,8 @@
 # Role   : publish immediately instead of waiting out the 4-minute quiet window.
 # Input  : none. Run it from anywhere inside the project folder.
 # Output : your work on GitHub, or a clear reason why not. Exit code 0 = published
-#          (or nothing to publish), 1 = blocked, 2 = conflict.
+#          (or nothing to publish), 1 = blocked, 2 = conflict, 3 = this would
+#          delete or roll back work and needs a human's word first.
 # Never  : force-pushes or discards anything.
 #
 #   pwsh push-now.ps1
@@ -41,6 +42,52 @@ if (@(git diff --name-only --diff-filter=U 2>$null).Count -gt 0) {
     if ($latest) { Say "Read: _conflicts\$($latest.Name)\CONFLICT.md" 'Yellow' }
     Say 'Finish it, then run this again.' 'Yellow'
     exit 2
+}
+
+# Adding work needs no permission; destroying it does. The engine refuses to
+# publish a deletion or a roll-back on its own - but THIS script publishes
+# directly whenever the engine is not running, so without the same check it
+# would be the way round the guard. That matters most here: this is the script
+# AGENTS run, and an agent that tidied a file away would send that tidy-up to
+# everybody's machine with no one having seen it.
+#
+# The rule lives in Get-DestructiveChanges in sync-core.ps1; this is the same
+# question asked with the same two git commands, and test_pushnow_destructive
+# compares the two verdicts on one repository so they cannot drift apart.
+$destroyed = @()
+foreach ($f in @(git diff --name-only --diff-filter=D HEAD 2>$null)) {
+    if ($f) { $destroyed += "deleted: $f" }
+}
+foreach ($f in @(git diff --name-only --diff-filter=M HEAD 2>$null)) {
+    if (-not $f) { continue }
+    $full = Join-Path $repo $f
+    if (-not (Test-Path -LiteralPath $full)) { continue }
+    $now = (git hash-object -- "$full" 2>$null | Select-Object -First 1)
+    if (-not $now) { continue }
+    foreach ($c in @(git rev-list -n 40 HEAD -- "$f" 2>$null)) {
+        if (-not $c) { continue }
+        $was = (git rev-parse -q --verify "${c}:$f" 2>$null | Select-Object -First 1)
+        if ($was -and $was -eq $now) { $destroyed += "rolled back: $f"; break }
+    }
+}
+if ($destroyed.Count -gt 0) {
+    # ORDINAL sort: the engine and the app both compute this signature, and a
+    # culture-aware sort would make a confirmation cover a different set here
+    # than it does there.
+    $paths = [Collections.Generic.List[string]]@($destroyed | ForEach-Object { ($_ -split ': ', 2)[1] })
+    $paths.Sort([StringComparer]::Ordinal)
+    $sha = [Security.Cryptography.SHA1]::Create()
+    $sig = ([BitConverter]::ToString($sha.ComputeHash(
+        [Text.Encoding]::UTF8.GetBytes(($paths -join "`n")))) -replace '-', '').Substring(0, 12)
+    if ((git config --local --get teamsync.destructiveok 2>$null) -ne $sig) {
+        Say 'This would DESTROY work on everybody machine. Nothing was published.' 'Red'
+        foreach ($d in ($destroyed | Select-Object -First 12)) { Say "  $d" 'Yellow' }
+        Say ''
+        Say 'If it was a mistake, put them back:  git checkout -- <file>' 'Yellow'
+        Say 'If you meant it, confirm it in the TeamSync window (Needs your OK),' 'Yellow'
+        Say 'then run this again. Agents: this is a decision for your human.' 'Yellow'
+        exit 3
+    }
 }
 
 # Is the sync engine running and listening?
@@ -109,10 +156,39 @@ if ($daemonAlive) {
 
     Say 'Asking the sync app to publish now...' 'Cyan'
     New-Item -ItemType File -Path $signal -Force | Out-Null
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+    # Wait on EVIDENCE, not on a clock.
+    #
+    # A fixed two-minute deadline reported "the sync app did not answer" while
+    # the engine published the very same work thirty seconds later. Measured,
+    # on a live test, with the partner's agent waiting on the result. For an
+    # agent that is the worst answer available: it says UNDONE about work that
+    # is done, and the obvious next move - run it again - is exactly wrong.
+    #
+    # A pass with several network round trips can take minutes, especially on
+    # a machine that has just woken. But the engine stamps its heartbeat every
+    # pass, so "still working" is observable. Keep waiting while that keeps
+    # moving; stop when it stops, which is the honest end of the story.
+    function Get-Beat {
+        foreach ($l in (Get-Content -LiteralPath $lock -ErrorAction SilentlyContinue)) {
+            if ($l -like 'time=*') {
+                $t = [datetime]::MinValue
+                if ([datetime]::TryParse($l.Substring(5), [ref]$t)) { return $t }
+            }
+        }
+        return [datetime]::MinValue
+    }
+    $lastBeat  = Get-Beat
+    $beatSeen  = Get-Date
+    $ceiling   = (Get-Date).AddSeconds([Math]::Max($TimeoutSeconds, 600))
+    $stalled   = $false
     $taken = $false
-    while ((Get-Date) -lt $deadline) {
+    while ((Get-Date) -lt $ceiling) {
         Start-Sleep -Milliseconds 500
+
+        $beat = Get-Beat
+        if ($beat -gt $lastBeat) { $lastBeat = $beat; $beatSeen = Get-Date }
+        if (((Get-Date) - $beatSeen).TotalSeconds -gt 90) { $stalled = $true; break }
 
         # The engine writes its network state into its heartbeat every second.
         # Offline is an answer, not something to time out on for two minutes.
@@ -150,9 +226,21 @@ if ($daemonAlive) {
         }
     }
 
-    if ($taken) {
-        Say "The sync app took the request but has not finished within $TimeoutSeconds s." 'Yellow'
-        Say 'Your work is committed and safe. Check the app window, and the network or VPN.' 'Yellow'
+    # Before saying anything failed, LOOK. The engine may have finished in the
+    # gap between the last poll and here, and reporting failure over finished
+    # work is the fault this whole block exists to prevent.
+    if (@(git status --porcelain 2>$null).Count -eq 0 -and
+        (git rev-list --count 'origin/main..HEAD' 2>$null) -eq '0') {
+        Remove-Item -LiteralPath (Join-Path $repo '.teamsync-agent.json') -Force -ErrorAction SilentlyContinue
+        Say 'Published.' 'Green'; exit 0
+    }
+
+    if ($stalled) {
+        Say 'The sync app stopped responding - its heartbeat has not moved for 90s.' 'Yellow'
+        Say 'Nothing is lost: your work is on disk. Check the app window.' 'Yellow'
+    } elseif ($taken) {
+        Say "The sync app took the request and is still working after $([int]((Get-Date) - $beatSeen).TotalSeconds)s." 'Yellow'
+        Say 'Your work is on disk and the engine publishes it by itself. Do not run this in a loop.' 'Yellow'
     } else {
         Say 'The sync app did not answer. Check its window.' 'Yellow'
     }

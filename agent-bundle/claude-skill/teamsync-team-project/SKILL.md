@@ -56,7 +56,25 @@ When a piece of work is FINISHED:
 Exit 0 = published (this also clears your announcement). Exit 1 = offline -
 tell the user, do not retry in a loop; the work is committed and the engine
 publishes it by itself when the connection returns. Exit 2 = conflict, see
-below.
+below. Exit 3 = this would destroy work, see below.
+
+## Exit 3 - it would delete or roll back somebody's work
+
+Adding work needs no permission. Destroying it does. If what you are about to
+publish DELETES a file, or puts a file back to an older version of itself,
+push-now stops and names the files. Nothing was pushed and nothing is lost.
+
+This is not a failure to work around. **It is a decision for your human, and
+never yours** - published, it removes that file, or that newer wording, from
+every teammate's machine.
+
+- If it was a mistake, put it back: `git checkout -- <file>`, then run
+  push-now again.
+- If your human really means it, they confirm it in the TeamSync window
+  ("Needs your OK"), and then push-now goes through.
+
+Do NOT `git rm`, `git checkout` your way past it, or edit the config that
+records the confirmation. Report what was named, and wait.
 
 ## Conflicts
 

@@ -118,6 +118,7 @@ Check the exit code:
 | 0 | published, or nothing to publish | carry on |
 | 1 | blocked: network, VPN, or the app did not answer | tell the user; do not retry in a loop |
 | 2 | **conflict** | stop; go to section 5 |
+| 3 | **it would delete or roll back work** | stop; go to section 5b |
 
 If you never run it, the work still goes out once the folder has been quiet for
 four minutes. That backstop exists for forgetfulness, not as the normal path.
@@ -237,6 +238,29 @@ version when it arrives.
 Tick the box beside it first. That marks you as the volunteer, and for
 everybody else the button disappears and your name shows instead — two people
 settling the same file separately is not help, it is the next conflict.
+
+## 5b. Exit 3 — it would destroy work
+
+Adding work needs no permission. Destroying it does. When what is about to be
+published DELETES a file, or puts a file back to an older version of itself,
+`push-now.ps1` stops and names the files. Nothing was pushed; nothing is lost.
+
+Published, it removes that file — or that newer wording — from **every**
+teammate's machine, and until this guard existed it went out with the log
+saying only "pushed 1 commit(s)". It is caught by comparing the disk against
+this machine's own history, so a machine that is merely behind is never caught
+by it: a file it has not received yet is not a file it deleted.
+
+**This is a decision for the people, never for an agent.**
+
+- A mistake: `git checkout -- <file>` puts the newest version back, then run
+  push-now again.
+- Meant: the person confirms it in the TeamSync window ("Needs your OK"), and
+  push-now then goes through. The confirmation covers exactly the files that
+  were listed — a later deletion is asked about again.
+
+Never route around it: no `git rm`, no hand-editing the config that records
+the confirmation, no pushing by hand.
 
 ## 6. Never
 
