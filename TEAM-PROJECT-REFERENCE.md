@@ -244,23 +244,37 @@ settling the same file separately is not help, it is the next conflict.
 Adding work needs no permission. Destroying it does. When what is about to be
 published DELETES a file, or puts a file back to an older version of itself,
 `push-now.ps1` stops and names the files. Nothing was pushed; nothing is lost.
+Editing inside a file never stops it. Neither does moving or renaming a file
+whose content arrives unchanged under the new name; a move that also changed
+the file, or that puts it somewhere the project ignores, does.
 
 Published, it removes that file — or that newer wording — from **every**
 teammate's machine, and until this guard existed it went out with the log
-saying only "pushed 1 commit(s)". It is caught by comparing the disk against
-this machine's own history, so a machine that is merely behind is never caught
-by it: a file it has not received yet is not a file it deleted.
+saying only "pushed 1 commit(s)".
+
+What it looks at is everything not yet on the shared branch: changes still on
+the disk **and** changes already committed on this machine — by hand, or by an
+editor's commit button — but not yet sent. "Older version" means *any* earlier
+version of the file, however far back. Everything is measured from the point
+where this machine and the team last agreed, so a machine that is merely
+behind is never caught: a file it has not received yet is not a file it
+deleted.
 
 **This is a decision for the people, never for an agent.**
 
-- A mistake: `git checkout -- <file>` puts the newest version back, then run
-  push-now again.
-- Meant: the person confirms it in the TeamSync window ("Needs your OK"), and
+- To see what is held without publishing anything:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File push-now.ps1 -CheckOnly`
+- A mistake: the person presses **Put them back** in the TeamSync window
+  ("Needs your OK"). It restores each file from the right place — the newest
+  version on this machine, or the team's version when the damage was already
+  committed here — then run push-now again.
+- Meant: the person confirms it in the same window (**Publish these**), and
   push-now then goes through. The confirmation covers exactly the files that
   were listed — a later deletion is asked about again.
 
-Never route around it: no `git rm`, no hand-editing the config that records
-the confirmation, no pushing by hand.
+Never route around it: no `git rm` and `git commit` by hand (a committed
+deletion is held just the same), no hand-editing the config that records the
+confirmation, no pushing by hand.
 
 ## 6. Never
 

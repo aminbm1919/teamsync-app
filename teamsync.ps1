@@ -36,7 +36,8 @@ $env:GIT_WORK_TREE = $repo
 Set-Location -LiteralPath ([IO.Path]::GetTempPath())
 
 . (Join-Path $PSScriptRoot 'sync-core.ps1')
-Initialize-SyncCore -Repo $repo -Branch $Branch -NoPopup:$NoPopup -AppVersion $AppVersion
+# Read git's answers as UTF-8 from the first question on (see Set-GitOutputUtf8).
+Set-GitOutputUtf8
 
 # Not --is-inside-work-tree: that answers about the CURRENT DIRECTORY, and ours
 # is deliberately elsewhere so the project folder stays movable. Ask about the
@@ -52,6 +53,23 @@ if (-not (git rev-parse --git-dir 2>$null)) {
 if (-not (git remote get-url origin 2>$null)) {
     Write-Host "No 'origin' remote. Run the setup first." -ForegroundColor Red; exit 1
 }
+# Only a project this app set up or joined - never a folder that merely has an
+# origin. See Test-SharedProject for what that used to do to a person's own
+# repository. Nothing is written into the folder on the way out: it is not ours.
+$shared = Test-SharedProject $repo
+if ($shared -ne $true) {
+    if ($null -eq $shared) {
+        Write-Host "Cannot tell whether this is a shared project: it has none of the files the app puts in one, and GitHub did not answer." -ForegroundColor Red
+    } else {
+        Write-Host "This folder is not a shared project. Its 'origin' is a repository this app did not set up, and nothing will be synced into it." -ForegroundColor Red
+        Write-Host 'To work on it together, share it from the app: that makes a NEW private project and leaves this repository alone.' -ForegroundColor Yellow
+    }
+    exit 1
+}
+
+# Only now, with the folder known to be ours, does the engine set anything in
+# it (Initialize-SyncCore writes the repository's git config).
+Initialize-SyncCore -Repo $repo -Branch $Branch -NoPopup:$NoPopup -AppVersion $AppVersion
 
 # Single instance per folder. The daemon may be running detached in the
 # background (the window was closed); starting a second one would race the

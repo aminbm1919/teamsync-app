@@ -22,7 +22,52 @@ function Initialize-SyncCore {
     $script:SC_Signal       = Join-Path $Repo '.teamsync-push-now'
     $script:SC_Offline      = $false
     $script:SC_PendingPublish = 0
+    Set-GitOutputUtf8
     Disable-GitPathQuoting
+}
+
+function Set-GitOutputUtf8 {
+    # Git prints UTF-8. Windows PowerShell decodes whatever a program prints
+    # with the CONSOLE's code page, and the console the app gives its engine
+    # (CREATE_NO_WINDOW, no parent console) starts on the machine's OEM page -
+    # 437 here, 720 or 1256 on a Persian or Arabic machine, UTF-8 almost
+    # nowhere. Measured under exactly those launch conditions: a file named
+    # یادداشت.md came back from `git diff --name-only` as
+    # "█î╪º╪»╪»╪º╪┤╪¬.md", and an edited Persian file was reported as not
+    # existing - so the destructive guard skipped it and the read-side hold
+    # compared a garbled name with the real one.
+    #
+    # core.quotePath (below) was half of the cure: it made git print the real
+    # name instead of escapes. This is the other half - reading those bytes as
+    # what they are. Every test had passed because the test harness set UTF-8
+    # itself before calling in, which is the one condition the field never has.
+    try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } catch { }
+}
+
+function Test-SharedProject {
+    # Is this a project this app set up, or joined? The engine runs on nothing
+    # else. An 'origin' alone proves nothing: it may be the person's own GitHub
+    # repository - a public one, even - and syncing there would publish their
+    # work, and this app's files, into it. Before 2.2.0 that is exactly what
+    # opening such a folder did: the engine checked only that an origin
+    # existed, found no 'main' on it, "started the project" by pushing the
+    # whole local history there, and went on committing every four minutes.
+    #
+    # The files the app plants are the local sign. Without them, the server is
+    # asked: an EMPTY repository is fine to start (there is nothing in it to
+    # overwrite - a joiner of a fresh project lands here), and one carrying
+    # this app's own refs is a project in use. Anything else is refused.
+    # Returns $true, $false, or $null when the server could not be asked.
+    param([string]$Root)
+    foreach ($m in 'push-now.ps1', 'TEAM-PROJECT-REFERENCE.md') {
+        if (Test-Path -LiteralPath (Join-Path $Root $m)) { return $true }
+    }
+    $heads = git ls-remote --heads origin 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    if (-not $heads) { return $true }
+    $ours = git ls-remote origin 'refs/teamsync/*' 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return [bool]$ours
 }
 
 function Disable-GitPathQuoting {
@@ -1039,49 +1084,282 @@ function Update-PlantedFiles {
     return $changed
 }
 
-function Get-DestructiveChanges {
-    # What is about to leave this machine that DESTROYS work rather than adding
-    # to it. Two shapes, both measured on this engine before this existed:
-    #
-    #   deleted  - a file that IS in our history is no longer on the disk. The
-    #              publish removes it from every teammate's machine, and the
-    #              log said only "pushed 1 commit(s)".
-    #   reverted - a file whose new content is byte-identical to an OLDER
-    #              version of itself. Not a guess: the blob hash matches a
-    #              previous commit's, which is exactly what putting a backup
-    #              back looks like. It replaces newer text with older text
-    #              wherever it lands.
-    #
-    # A machine that is merely BEHIND is not destructive and must never be
-    # caught here - and it is not, because git compares the disk against THIS
-    # machine's own history, not against the server. "I never had it" and "I
-    # deleted it" are different states, which is why signing in from a second
-    # computer is safe.
-    param([int]$MaxHistory = 40)
+# >>> destructive guard
+# This block is IDENTICAL in sync-core.ps1 and push-now.template.ps1, and
+# test_destructive_agreement fails the moment the two copies differ by a
+# single character. push-now cannot dot-source this file - it is planted into
+# projects and runs without the app - so the rule travels as a copy, and the
+# test is what keeps it one rule.
+#
+# What is about to leave this machine that DESTROYS work rather than adding
+# to it. Two shapes, both measured on this engine before the guard existed:
+#
+#   deleted  - a file the team has, or this machine had, that will no longer
+#              exist once this is published. It disappears from every
+#              teammate's disk, and the log used to say only "pushed 1
+#              commit(s)". A MOVE is not a deletion: when the file's exact
+#              content arrives under a new name in the same publish, nothing
+#              is destroyed and nobody is asked (the user's ruling,
+#              2026-10-01 - asking on every move teaches people to approve
+#              without reading, and then the real deletion slips through).
+#              Moved AND changed, or moved somewhere the project ignores,
+#              still asks.
+#   reverted - a file whose new content is byte-identical to an EARLIER
+#              version of itself. Not a guess: the blob hash matches one the
+#              file really held, which is exactly what putting a backup back
+#              looks like. Newer text is replaced by older text wherever it
+#              lands.
+#
+# "About to leave" means everything not yet on the shared branch: work still
+# on the disk AND work already committed here but not yet sent. The second
+# half used to be invisible - a deletion made with `git commit` by hand, or
+# with an editor's commit button, went out without anybody being asked.
+#
+# "Earlier version" means EVERY earlier version. It used to mean the last
+# forty, a ceiling that existed only because each version cost one git
+# process: 14 changed files of a real project meant about 250 processes per
+# look, every four seconds, which froze the app's window for good. One
+# `git log` pass now reads every version of every file at once, so the
+# ceiling saved nothing and is gone.
+#
+# A machine that is merely BEHIND is still never caught. Everything is
+# measured from where this machine and the team last agreed - the merge base
+# of HEAD and the shared branch - never from the server's tip, so a file this
+# machine simply has not received yet is not "deleted". "I never had it" and
+# "I deleted it" stay different states.
+#
+# Any git question that goes unanswered throws. It must never read as
+# "nothing destructive here"; the caller holds the publish instead.
+$script:DG_Zero = '0' * 40
 
-    $deleted = @()
-    foreach ($f in @(git diff --name-only --diff-filter=D HEAD 2>$null)) {
-        if ($f) { $deleted += $f }
+function Invoke-DGGit {
+    param([string[]]$GitArgs, [string]$What)
+    $ErrorActionPreference = 'Continue'
+    # Read-only questions must not take git's optional index lock: the app's
+    # window asks the same questions while the engine is committing, and a
+    # lock held for a moment by a reader made the writer's `git add` fail.
+    $locks = $env:GIT_OPTIONAL_LOCKS
+    $env:GIT_OPTIONAL_LOCKS = '0'
+    try {
+        $out = & git @GitArgs 2>$null
+        $code = $LASTEXITCODE
+    } finally {
+        $env:GIT_OPTIONAL_LOCKS = $locks
     }
+    if ($code -ne 0) { throw "git could not answer the destructive check ($What)" }
+    $out
+}
 
-    $reverted = @()
-    foreach ($f in @(git diff --name-only --diff-filter=M HEAD 2>$null)) {
-        if (-not $f) { continue }
-        $full = Join-Path $script:SC_Repo $f
-        if (-not (Test-Path -LiteralPath $full)) { continue }
-        $now = (git hash-object -- "$full" 2>$null | Select-Object -First 1)
-        if (-not $now) { continue }
-        # Walk only this file's own history, and only so far back: the answer
-        # we want is "has this exact content been here before", and a backup
-        # older than forty edits of one file is not what anybody just restored.
-        foreach ($c in @(git rev-list -n $MaxHistory HEAD -- "$f" 2>$null)) {
-            if (-not $c) { continue }
-            $was = (git rev-parse -q --verify "${c}:$f" 2>$null | Select-Object -First 1)
-            if ($was -and $was -eq $now) { $reverted += $f; break }
+function Split-DGZ {
+    # git -z output, as PowerShell hands it over: lines, with NULs inside.
+    param($Lines)
+    foreach ($t in ((@($Lines) -join "`n").Split([char]0))) {
+        $t = $t.TrimStart([char]13, [char]10)
+        if ($t) { $t }
+    }
+}
+
+function Split-DGBatches {
+    # Windows caps a command line at 32,767 characters, and a guard that died
+    # on a large change set would hide exactly the large accidents.
+    param([string[]]$Items, [int]$Limit = 8000)
+    $batches = New-Object 'System.Collections.Generic.List[object]'
+    $batch = New-Object 'System.Collections.Generic.List[string]'
+    $size = 0
+    foreach ($it in $Items) {
+        if ($batch.Count -gt 0 -and ($size + $it.Length + 3) -gt $Limit) {
+            $batches.Add($batch.ToArray())
+            $batch = New-Object 'System.Collections.Generic.List[string]'
+            $size = 0
+        }
+        $batch.Add($it)
+        $size += $it.Length + 3
+    }
+    if ($batch.Count -gt 0) { $batches.Add($batch.ToArray()) }
+    return ,$batches
+}
+
+function Get-DGChanged {
+    # Paths that differ between $Base and the disk, by kind: D, M or A.
+    # --no-renames: a rename is a deletion of the old name for everybody else,
+    # whether or not it happened to be staged with `git mv`.
+    param([string]$Base, [string]$Letter)
+    Split-DGZ (Invoke-DGGit @('diff', '--name-only', '-z', '--no-renames',
+                              "--diff-filter=$Letter", $Base, '--') "diff $Letter $Base")
+}
+
+function Get-DGVersions {
+    # Every blob each path has held anywhere in the history of $Rev - both
+    # sides of every change, and merges too: -c lists a merge whose result
+    # differs from all of its parents, which is where a hand-made conflict
+    # resolution lives. One pass for all paths.
+    param([string]$Rev, [string[]]$Paths)
+    $found = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    foreach ($p in $Paths) {
+        $found[$p] = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    }
+    foreach ($batch in (Split-DGBatches $Paths)) {
+        $gitArgs = @('--literal-pathspecs', 'log', $Rev, '--full-history', '--root', '-c', '--raw',
+                     '--no-abbrev', '--no-renames', '-z', '--format=', '--') + $batch
+        $tokens = @(Split-DGZ (Invoke-DGGit $gitArgs "log $Rev"))
+        $i = 0
+        while ($i -lt $tokens.Count) {
+            $meta = $tokens[$i]
+            if ($meta.StartsWith(':') -and ($i + 1) -lt $tokens.Count) {
+                # ":<modes> <blobs> <status>" with one colon per parent.
+                $body = $meta.TrimStart(':')
+                $parents = $meta.Length - $body.Length
+                $fields = $body.Split(' ')
+                $path = $tokens[$i + 1]
+                if ($found.ContainsKey($path)) {
+                    for ($k = $parents + 1; $k -lt (2 * ($parents + 1)) -and $k -lt $fields.Count; $k++) {
+                        if ($fields[$k] -ne $script:DG_Zero) { [void]$found[$path].Add($fields[$k]) }
+                    }
+                }
+                $i += 2
+            } else {
+                $i += 1
+            }
+        }
+    }
+    return ,$found
+}
+
+function Get-DGWorkingBlobs {
+    # What each file on the disk would be recorded as: its blob id after git's
+    # own clean filters, exactly what a commit would store.
+    param([string]$Root, [string[]]$Paths)
+    $out = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    $byFull = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    foreach ($p in $Paths) {
+        $full = Join-Path $Root $p
+        if (Test-Path -LiteralPath $full -PathType Leaf) { $byFull[$full] = $p }
+    }
+    foreach ($batch in (Split-DGBatches @($byFull.Keys))) {
+        $shas = @(Invoke-DGGit (@('hash-object', '--') + $batch) 'hash-object' | Where-Object { $_ })
+        if ($shas.Count -ne $batch.Count) { throw 'git hash-object answered for the wrong number of files' }
+        for ($k = 0; $k -lt $batch.Count; $k++) { $out[$byFull[$batch[$k]]] = "$($shas[$k])".Trim() }
+    }
+    return ,$out
+}
+
+function Get-DGRemoved {
+    # Paths that will be gone, measured from $Base, each with the blob it held
+    # there - what a move would have to carry somewhere else intact.
+    param([string]$Base)
+    $out = New-Object 'System.Collections.Generic.List[object]'
+    $tokens = @(Split-DGZ (Invoke-DGGit @('diff', '--raw', '-z', '--no-renames', '--no-abbrev',
+                                          '--diff-filter=D', $Base, '--') "diff --raw D $Base"))
+    $i = 0
+    while ($i -lt $tokens.Count) {
+        $meta = $tokens[$i]
+        if ($meta.StartsWith(':') -and ($i + 1) -lt $tokens.Count) {
+            # ":<old mode> <new mode> <old blob> <new blob> D"
+            $fields = $meta.TrimStart(':').Split(' ')
+            $out.Add(@($tokens[$i + 1], $fields[2]))
+            $i += 2
+        } else {
+            $i += 1
+        }
+    }
+    return ,$out
+}
+
+function Get-DGArrivals {
+    # The blob of every file that will exist after this publish but was not
+    # there at one of $Bases: added and tracked, or new on the disk and not
+    # ignored - exactly what `git add -A` is about to take in. A file that
+    # disappears while its exact content arrives here was MOVED.
+    param([string]$Root, [string[]]$Bases)
+    $paths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($b in $Bases) {
+        foreach ($p in @(Get-DGChanged $b 'A')) { [void]$paths.Add($p) }
+    }
+    foreach ($p in @(Split-DGZ (Invoke-DGGit @('ls-files', '-z', '--others', '--exclude-standard') 'ls-files --others'))) {
+        [void]$paths.Add($p)
+    }
+    $blobs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    if ($paths.Count -gt 0) {
+        $now = Get-DGWorkingBlobs -Root $Root -Paths @($paths)
+        foreach ($v in $now.Values) { [void]$blobs.Add($v) }
+    }
+    return ,$blobs
+}
+
+function Get-DestructiveChangesIn {
+    param([string]$Root, [string]$Upstream)
+    $ErrorActionPreference = 'Continue'
+    $head = git rev-parse -q --verify HEAD 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $head) { return @{ Deleted = @(); Reverted = @() } }
+    $head = "$head".Trim()
+    $base = git merge-base HEAD $Upstream 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $base) { $base = $head } else { $base = "$base".Trim() }
+
+    # Gone, with the content each one held - from this machine's last commit,
+    # and (below) from what the team has.
+    $removed = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    $gone = { param($pair)
+        if (-not $removed.ContainsKey($pair[0])) {
+            $removed[$pair[0]] = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        }
+        [void]$removed[$pair[0]].Add($pair[1])
+    }
+    foreach ($pair in (Get-DGRemoved 'HEAD')) { & $gone $pair }
+    # Changed on the disk since this machine's last commit: judged against
+    # every version this machine has ever held.
+    $uncommitted = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($p in @(Get-DGChanged 'HEAD' 'M')) { $uncommitted.Add($p) }
+    # Committed here but not yet sent: judged against every version the TEAM
+    # has held, so an edit that is merely unpublished is never taken for a
+    # roll-back of itself.
+    $committedOnly = New-Object 'System.Collections.Generic.List[string]'
+    if ($base -ne $head) {
+        foreach ($pair in (Get-DGRemoved $base)) { & $gone $pair }
+        $readded = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($p in @(Get-DGChanged 'HEAD' 'A')) { [void]$readded.Add($p) }
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($p in $uncommitted) { [void]$seen.Add($p) }
+        foreach ($p in @(Get-DGChanged $base 'M')) {
+            if (-not $seen.Add($p)) { continue }
+            # Removed by a local commit and then put back on the disk: that is
+            # uncommitted work like any other edit.
+            if ($readded.Contains($p)) { $uncommitted.Add($p) } else { $committedOnly.Add($p) }
         }
     }
 
-    return @{ Deleted = @($deleted); Reverted = @($reverted) }
+    $now = Get-DGWorkingBlobs -Root $Root -Paths (@($uncommitted) + @($committedOnly))
+    $reverted = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $group = @($uncommitted | Where-Object { $now.ContainsKey($_) })
+    if ($group.Count -gt 0) {
+        $hist = Get-DGVersions 'HEAD' $group
+        foreach ($p in $group) { if ($hist[$p].Contains($now[$p])) { [void]$reverted.Add($p) } }
+    }
+    $group = @($committedOnly | Where-Object { $now.ContainsKey($_) })
+    if ($group.Count -gt 0) {
+        $hist = Get-DGVersions $base $group
+        foreach ($p in $group) { if ($hist[$p].Contains($now[$p])) { [void]$reverted.Add($p) } }
+    }
+
+    # A deletion is excused only when EVERY version it takes away arrives
+    # intact under another name: moved, not destroyed. Moved and changed -
+    # or changed here before it moved, so the team's version is not what
+    # arrives - still asks.
+    $deleted = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    if ($removed.Count -gt 0) {
+        $bases = if ($base -ne $head) { @('HEAD', $base) } else { @('HEAD') }
+        $arrived = Get-DGArrivals -Root $Root -Bases $bases
+        foreach ($p in $removed.Keys) {
+            foreach ($blob in $removed[$p]) {
+                if (-not $arrived.Contains($blob)) { [void]$deleted.Add($p); break }
+            }
+        }
+    }
+
+    $d = [string[]]@($deleted)
+    [Array]::Sort($d, [StringComparer]::Ordinal)
+    $r = [string[]]@($reverted)
+    [Array]::Sort($r, [StringComparer]::Ordinal)
+    return @{ Deleted = $d; Reverted = $r }
 }
 
 function Get-DestructiveSignature {
@@ -1101,6 +1379,12 @@ function Get-DestructiveSignature {
     $sha  = [Security.Cryptography.SHA1]::Create()
     return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($text))) -replace '-', '').Substring(0, 12)
 }
+# <<< destructive guard
+
+function Get-DestructiveChanges {
+    # The engine's view: this repository, measured against the shared branch.
+    Get-DestructiveChangesIn -Root $script:SC_Repo -Upstream "refs/remotes/origin/$($script:SC_Branch)"
+}
 
 function Approve-Destructive {
     # The person said "yes, I meant it". Recorded on the disk against THIS set,
@@ -1119,9 +1403,27 @@ function Test-DestructiveApproved {
 function Restore-Destructive {
     # The other answer: put them back. This is the undo the app never had -
     # every version is already in every clone, there was simply no door to it.
+    #
+    # Where each file comes back FROM depends on where the damage sits. Still
+    # on the disk: from this machine's own newest version (HEAD). Already
+    # committed here: from the version the team has (the merge base), because
+    # HEAD itself is the damage. A plain `git checkout -- <file>` restored
+    # from the index, so a deletion staged with `git rm` could not be undone
+    # at all.
     param($Changes)
+    $base = git merge-base HEAD "refs/remotes/origin/$($script:SC_Branch)" 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $base) { $base = 'HEAD' } else { $base = "$base".Trim() }
     foreach ($f in @(@($Changes.Deleted) + @($Changes.Reverted))) {
-        if ($f) { git checkout -- "$f" 2>$null | Out-Null }
+        if (-not $f) { continue }
+        git cat-file -e "HEAD:$f" 2>$null
+        $inHead = ($LASTEXITCODE -eq 0)
+        $dirty = $true
+        if ($inHead) {
+            git --literal-pathspecs diff --quiet HEAD -- "$f" 2>$null
+            $dirty = ($LASTEXITCODE -ne 0)
+        }
+        $source = if ($inHead -and $dirty) { 'HEAD' } else { $base }
+        git --literal-pathspecs checkout $source -- "$f" 2>$null | Out-Null
     }
     git config --local --unset teamsync.destructiveok 2>$null | Out-Null
 }
@@ -1460,7 +1762,19 @@ function Invoke-Publish {
     # reversion is published exactly like an edit - it was measured removing a
     # file from every teammate's machine while the log said "pushed 1
     # commit(s)" - so the machine no longer makes that call on its own.
-    $destructive = Get-DestructiveChanges
+    try {
+        $destructive = Get-DestructiveChanges
+        $script:SC_GuardFailSaid = $null
+    } catch {
+        # Could not look. That is not the same as "nothing to see": hold the
+        # publish rather than send something nobody was able to check.
+        $why = $_.Exception.Message
+        if ($script:SC_GuardFailSaid -ne $why) {
+            $script:SC_GuardFailSaid = $why
+            Write-Log "not publishing - $why; trying again on the next pass" 'Yellow'
+        }
+        return $false
+    }
     $script:SC_Destructive = $destructive
     if (@($destructive.Deleted).Count -or @($destructive.Reverted).Count) {
         if (-not (Test-DestructiveApproved $destructive)) {

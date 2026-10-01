@@ -28,6 +28,14 @@ $ErrorActionPreference = 'Stop'
 function Step($t) { Write-Host "==> $t" -ForegroundColor Cyan }
 function Die($t)  { Write-Host $t -ForegroundColor Red; exit 1 }
 
+# Git prints UTF-8; Windows PowerShell reads a program's output in the console's
+# code page unless told otherwise, which turns every non-latin path and name
+# into garbage. Read it as UTF-8 here, and give the console back as it was.
+$script:ConsoleEncodingWas = $null
+try { $script:ConsoleEncodingWas = [Console]::OutputEncoding } catch { }
+try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } catch { }
+try {
+
 if (-not $Path) { $Path = Join-Path (Get-Location) $RepoName }
 
 if (Test-Path -LiteralPath $Path) {
@@ -41,9 +49,27 @@ if (-not (Test-Prerequisites)) { exit 1 }
 $url = "https://github.com/$Owner/$RepoName"
 
 Step "Downloading $Owner/$RepoName"
+$ErrorActionPreference = 'Continue'
 git clone $url $Path
-if ($LASTEXITCODE -ne 0) {
-    Die "Could not download it.`n`nMost likely you have not accepted the invitation yet - check your email or`nhttps://github.com/notifications . Until you accept, GitHub answers`n'repository not found', which is not a typo on your side.`n`nOtherwise: check the name, and check your VPN."
+$cloned = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = 'Stop'
+if (-not $cloned) {
+    # Two different people read this. Somebody joining by hand most often has
+    # not accepted the invitation yet. But when the app joins, it has just
+    # accepted it AND checked that GitHub shows the project to this account -
+    # so for them the usual cause is git on this machine signing in to GitHub
+    # as a DIFFERENT account. The old message only knew the first story, and
+    # told the second person, seconds after the app had accepted for them,
+    # that they had probably not accepted.
+    Die ("Could not download it.`n`n" +
+         "Joining by hand? Accept the invitation first - check your email or`n" +
+         "https://github.com/notifications . Until you accept, GitHub answers`n" +
+         "'repository not found', which is not a typo on your side.`n`n" +
+         "Joined from the app? It has already accepted and checked access, so the`n" +
+         "likely cause is that git on this machine signs in to GitHub as another`n" +
+         "account. Compare:  gh auth status   with the account git uses`n" +
+         "(Windows Credential Manager, entry git:https://github.com).`n`n" +
+         "Otherwise: check the name, and check your VPN.")
 }
 
 $repo = (Resolve-Path -LiteralPath $Path).Path
@@ -77,4 +103,8 @@ if ($NoWatch) {
 } else {
     Write-Host 'Starting teamsync...' -ForegroundColor Yellow
     & (Join-Path $PSScriptRoot 'teamsync.ps1') -Path $repo
+}
+
+} finally {
+    if ($script:ConsoleEncodingWas) { try { [Console]::OutputEncoding = $script:ConsoleEncodingWas } catch { } }
 }

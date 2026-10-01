@@ -39,7 +39,7 @@ APP_NAME = "TeamSync"
 # and third are single digits, so the line runs 2.1.0 ... 2.1.9, then 2.2.0,
 # on to 2.9.9, and then 3.0.0. publish-release.ps1 refuses anything else, so
 # the rule cannot be broken by forgetting it.
-APP_VERSION = "2.1.9"           # compared against the newest release tag
+APP_VERSION = "2.2.0"           # compared against the newest release tag
 UPDATE_REPO = "aminbm1919/teamsync-app"   # public since 2026-08-28: source and releases
 # The app ships as a folder, not a single file. A one-file build unpacks ~970
 # files into %TEMP% on every launch, and on a machine whose antivirus interferes
@@ -110,13 +110,37 @@ def git(repo, *args):
     try:
         out = subprocess.run(
             ["git"] + list(args), cwd=repo, capture_output=True,
-            creationflags=CREATE_NO_WINDOW,
+            creationflags=CREATE_NO_WINDOW, env=_GIT_ENV,
         )
         if out.returncode != 0:
             return ""
         return out.stdout.decode("utf-8", "replace").strip()
     except Exception:
         return ""
+
+
+# The window only ever READS a project while the engine writes it, so its git
+# calls must not take git's optional index lock: a reader holding it for a
+# moment made the engine's `git add` fail. Locks git truly needs (a checkout,
+# a config write) are not optional and are still taken.
+_GIT_ENV = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+
+
+def git_bytes(repo, *args):
+    """Run one git command in repo. Returns stdout as bytes, or None on failure.
+
+    For output that is NUL-separated (-z) or has to be exact: nothing stripped,
+    nothing guessed, and a failure is None - never an empty answer that could
+    be read as "nothing there".
+    """
+    try:
+        out = subprocess.run(["git"] + list(args), cwd=repo, capture_output=True,
+                             creationflags=CREATE_NO_WINDOW, env=_GIT_ENV)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout
 
 
 def pid_alive(pid):
@@ -248,37 +272,213 @@ def _is_me(name, mine):
     return name == mine
 
 
+class GuardError(Exception):
+    """A question the destructive check could not get answered.
+
+    Never to be read as "nothing destructive here": the caller keeps what it
+    last knew, exactly as the engine holds the publish.
+    """
+
+
+_ZERO_SHA = "0" * 40
+
+
+def _guard_git(repo, what, *args):
+    raw = git_bytes(repo, *args)
+    if raw is None:
+        raise GuardError(f"git could not answer the destructive check ({what})")
+    return raw
+
+
+def _split_z(raw):
+    """git -z output as a list, separators and stray newlines dropped."""
+    return [t.lstrip("\r\n") for t in raw.decode("utf-8", "replace").split("\0")
+            if t.lstrip("\r\n")]
+
+
+def _batches(items, limit=8000):
+    """Windows caps a command line at 32,767 characters, and a guard that died
+    on a large change set would hide exactly the large accidents."""
+    batch, size = [], 0
+    for it in items:
+        if batch and size + len(it) + 3 > limit:
+            yield batch
+            batch, size = [], 0
+        batch.append(it)
+        size += len(it) + 3
+    if batch:
+        yield batch
+
+
+def _guard_changed(repo, base, letter):
+    # --no-renames: a rename deletes the old name for everybody else, whether
+    # or not it happened to be staged with `git mv`.
+    return _split_z(_guard_git(repo, f"diff {letter} {base}", "diff", "--name-only", "-z",
+                               "--no-renames", "--diff-filter=" + letter, base, "--"))
+
+
+def _guard_versions(repo, rev, paths):
+    """{path: every blob the path held anywhere in rev's history}.
+
+    Both sides of every change, and merges too: -c lists a merge whose result
+    differs from all of its parents, which is where a hand-made conflict
+    resolution lives. One pass for all the paths.
+    """
+    found = {p: set() for p in paths}
+    for batch in _batches(paths):
+        tokens = _split_z(_guard_git(
+            repo, f"log {rev}", "--literal-pathspecs", "log", rev, "--full-history", "--root",
+            "-c", "--raw", "--no-abbrev", "--no-renames", "-z", "--format=", "--", *batch))
+        i = 0
+        while i < len(tokens):
+            meta = tokens[i]
+            if meta.startswith(":") and i + 1 < len(tokens):
+                # ":<modes> <blobs> <status>", one colon per parent
+                parents = len(meta) - len(meta.lstrip(":"))
+                fields = meta.lstrip(":").split(" ")
+                path = tokens[i + 1]
+                if path in found:
+                    found[path].update(s for s in fields[parents + 1: 2 * (parents + 1)]
+                                       if s != _ZERO_SHA)
+                i += 2
+            else:
+                i += 1
+    return found
+
+
+def _guard_working_blobs(repo, paths):
+    """{path: the blob the file on disk would be committed as} - after git's
+    own clean filters, exactly what a commit would store."""
+    by_full = {}
+    for p in paths:
+        full = os.path.join(repo, p.replace("/", os.sep))
+        if os.path.isfile(full):
+            by_full[full] = p
+    out = {}
+    for batch in _batches(list(by_full)):
+        shas = _guard_git(repo, "hash-object", "hash-object", "--", *batch).decode(
+            "ascii", "replace").split()
+        if len(shas) != len(batch):
+            raise GuardError("git hash-object answered for the wrong number of files")
+        out.update((by_full[f], s) for f, s in zip(batch, shas))
+    return out
+
+
+def _guard_removed(repo, base):
+    """[(path, blob it held at base)] for every path that will be gone."""
+    tokens = _split_z(_guard_git(repo, f"diff --raw D {base}", "diff", "--raw", "-z",
+                                 "--no-renames", "--no-abbrev", "--diff-filter=D", base, "--"))
+    out, i = [], 0
+    while i < len(tokens):
+        meta = tokens[i]
+        if meta.startswith(":") and i + 1 < len(tokens):
+            # ":<old mode> <new mode> <old blob> <new blob> D"
+            out.append((tokens[i + 1], meta.lstrip(":").split(" ")[2]))
+            i += 2
+        else:
+            i += 1
+    return out
+
+
+def _guard_arrivals(repo, bases):
+    """The blob of every file that will exist after this publish but was not
+    there at one of `bases`: added and tracked, or new on the disk and not
+    ignored - what `git add -A` is about to take in. A file that disappears
+    while its exact content arrives here was MOVED."""
+    paths = set()
+    for b in bases:
+        paths.update(_guard_changed(repo, b, "A"))
+    paths.update(_split_z(_guard_git(repo, "ls-files --others", "ls-files", "-z",
+                                     "--others", "--exclude-standard")))
+    return set(_guard_working_blobs(repo, sorted(paths)).values()) if paths else set()
+
+
 def destructive_changes(repo):
     """What is waiting to go out that would DESTROY work, not add to it.
 
-    The engine computes the same thing before every publish and refuses to
-    send it on its own. This is the window's copy, so it can show the person
-    what is being held and let them decide. See Get-DestructiveChanges in
-    sync-core.ps1 for the reasoning; the two must agree, and
-    test_destructive_guard proves they do.
+    The window's copy of the rule the engine applies before every publish
+    (the "destructive guard" block in sync-core.ps1, read its comment for the
+    reasoning). test_destructive_agreement holds the copies to one answer.
+
+      deleted  - a file the team has, or this machine had, that will no
+                 longer exist once this is published - unless its exact
+                 content arrives under a new name in the same publish: a
+                 move destroys nothing and is not asked about (the user's
+                 ruling, 2026-10-01); moved AND changed still is
+      reverted - a file whose content is byte-identical to an EARLIER
+                 version of itself - every earlier version, not the last forty
+
+    "Waiting to go out" is everything not yet on the shared branch: work on
+    the disk AND work already committed here but not sent, measured from the
+    merge base, so a machine that is merely behind is never caught.
+
+    A handful of git calls whatever the size: the old shape asked once per
+    version of every file - ~250 processes for 14 files of a real project, on
+    the window's own thread, every four seconds - and the window never
+    answered again. Raises GuardError when git cannot answer.
     """
-    deleted = [f for f in git(repo, "diff", "--name-only", "--diff-filter=D",
-                              "HEAD").splitlines() if f.strip()]
-    reverted = []
-    for f in git(repo, "diff", "--name-only", "--diff-filter=M", "HEAD").splitlines():
-        f = f.strip()
-        if not f:
-            continue
-        full = os.path.join(repo, f.replace("/", os.sep))
-        if not os.path.exists(full):
-            continue
-        now = git(repo, "hash-object", "--", full).strip()
-        if not now:
-            continue
-        for c in git(repo, "rev-list", "-n", "40", "HEAD", "--", f).splitlines():
-            c = c.strip()
-            if not c:
+    head = git_bytes(repo, "rev-parse", "-q", "--verify", "HEAD")
+    if not head:
+        return {"deleted": [], "reverted": []}
+    head = head.decode("ascii", "replace").strip()
+    base = git_bytes(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
+    base = base.decode("ascii", "replace").strip() if base else ""
+    base = base or head
+
+    # gone, with the content each one held - from this machine's last commit
+    # and (below) from what the team has
+    removed = {}
+    for p, blob in _guard_removed(repo, "HEAD"):
+        removed.setdefault(p, set()).add(blob)
+    # changed on the disk since this machine's last commit: judged against
+    # every version this machine has ever held
+    uncommitted = list(_guard_changed(repo, "HEAD", "M"))
+    # committed here, not yet sent: judged against every version the TEAM has
+    # held, so an edit that is merely unpublished is never taken for a
+    # roll-back of itself
+    committed_only = []
+    if base != head:
+        for p, blob in _guard_removed(repo, base):
+            removed.setdefault(p, set()).add(blob)
+        readded = set(_guard_changed(repo, "HEAD", "A"))
+        seen = set(uncommitted)
+        for p in _guard_changed(repo, base, "M"):
+            if p in seen:
                 continue
-            was = git(repo, "rev-parse", "-q", "--verify", c + ":" + f).strip()
-            if was and was == now:
-                reverted.append(f)
-                break
-    return {"deleted": deleted, "reverted": reverted}
+            seen.add(p)
+            # removed by a local commit and then put back on the disk: that is
+            # uncommitted work like any other edit
+            (uncommitted if p in readded else committed_only).append(p)
+
+    now = _guard_working_blobs(repo, uncommitted + committed_only)
+    reverted = set()
+    for rev, group in (("HEAD", uncommitted), (base, committed_only)):
+        group = [p for p in group if p in now]
+        if group:
+            hist = _guard_versions(repo, rev, group)
+            reverted.update(p for p in group if now[p] in hist.get(p, ()))
+
+    # excused only when EVERY version a deletion takes away arrives intact
+    # under another name: moved, not destroyed
+    deleted = set()
+    if removed:
+        arrived = _guard_arrivals(repo, ["HEAD"] + ([base] if base != head else []))
+        deleted = {p for p, blobs in removed.items() if not blobs <= arrived}
+
+    return {"deleted": sorted(deleted, key=_ordinal),
+            "reverted": sorted(reverted, key=_ordinal)}
+
+
+def _ordinal(text):
+    """The order .NET's StringComparer.Ordinal uses: UTF-16 code units.
+
+    Python's own sorted() orders by code point. The two agree except where a
+    character outside the basic plane (an emoji) meets one in U+E000-U+FFFF
+    (full-width forms, private use) - and there they disagree, so a signature
+    the window computed could never match the engine's, and a confirmed
+    accident would stay held for ever. Sorting by code units removes the case.
+    """
+    return text.encode("utf-16-be")
 
 
 def destructive_signature(changes):
@@ -289,11 +489,21 @@ def destructive_signature(changes):
     say ordinal explicitly.
     """
     import hashlib
-    paths = sorted(list(changes.get("deleted", [])) + list(changes.get("reverted", [])))
+    paths = sorted(list(changes.get("deleted", [])) + list(changes.get("reverted", [])),
+                   key=_ordinal)
     if not paths:
         return ""
     text = "\n".join(paths)
     return hashlib.sha1(text.encode("utf-8")).hexdigest().upper()[:12]
+
+
+def read_destructive(repo):
+    """(what would be destroyed, the signature already confirmed) - git only,
+    no widgets, so it is safe on a worker thread. Raises GuardError when git
+    cannot answer."""
+    changes = destructive_changes(repo)
+    approved = git(repo, "config", "--local", "--get", "teamsync.destructiveok")
+    return changes, approved
 
 
 def approve_destructive(repo, changes):
@@ -307,10 +517,27 @@ def restore_destructive(repo, changes):
 
     This is the undo the app never had. Every version has always been in every
     clone - there was simply no door to it that did not require knowing git.
+
+    Where each file comes back FROM depends on where the damage sits. Still on
+    the disk: this machine's own newest version (HEAD). Already committed
+    here: the version the team has (the merge base), because HEAD itself is
+    the damage. A plain `git checkout -- <file>` restored from the index, so a
+    deletion staged with `git rm` could not be undone at all. Mirrors
+    Restore-Destructive in sync-core.ps1.
     """
+    base = git(repo, "merge-base", "HEAD", "refs/remotes/origin/main") or "HEAD"
     for f in list(changes.get("deleted", [])) + list(changes.get("reverted", [])):
-        if f:
-            git(repo, "checkout", "--", f)
+        if not f:
+            continue
+        in_head = git_bytes(repo, "cat-file", "-e", "HEAD:" + f) is not None
+        dirty = True
+        if in_head:
+            # --quiet answers through the exit code: 1 = differs, which
+            # git_bytes reports as None.
+            dirty = git_bytes(repo, "--literal-pathspecs", "diff", "--quiet",
+                              "HEAD", "--", f) is None
+        source = "HEAD" if (in_head and dirty) else base
+        git(repo, "--literal-pathspecs", "checkout", source, "--", f)
     git(repo, "config", "--local", "--unset", "teamsync.destructiveok")
 
 
@@ -824,6 +1051,32 @@ def my_own_names(repo):
     return {n for n, key in groups.items() if key in mine_keys} | names
 
 
+def read_partner_state(repo):
+    """Everything the team corner and the 'Right now' column show, read from
+    git. No widget is touched, so it runs on a worker thread."""
+    me = my_own_names(repo)
+    people = team_presence(repo, me)
+    # Only asked for when it could change the answer - the ranking exists to
+    # choose ten out of more than ten, and it caches for a minute anyway. A
+    # four-person project never pays for it.
+    activity = (recent_activity(repo)
+                if len([p for p in people if p["online"]]) > TeamPanel.HOVER_MAX
+                else {})
+    return {"me": me, "people": people, "activity": activity,
+            "conflicts": team_conflicts(repo, me),
+            "pending": team_pending_files(repo, me)}
+
+
+def read_project_state(repo):
+    """One look at a project for the window's four-second tick: the team,
+    an open conflict, and what is waiting to be sent. Worker-thread safe."""
+    snap = read_partner_state(repo)
+    snap["unmerged"] = git(repo, "diff", "--name-only", "--diff-filter=U")
+    snap["ahead"] = git(repo, "rev-list", "--count", "origin/main..HEAD") or "0"
+    snap["net"] = daemon_state(repo).get("net")
+    return snap
+
+
 def seen_phrase(ago_seconds):
     """When the partner was last here, said the way a person would.
 
@@ -992,6 +1245,90 @@ def forget_project(cfg, path):
     path = os.path.normcase(os.path.normpath(path))
     cfg['projects'] = [e for e in cfg.get('projects', [])
                        if os.path.normcase(e.get('path', '')) != path]
+
+
+# The files this app plants in every shared project, tracked in its history -
+# so a fresh clone has them too. Their presence is the local sign that a
+# folder is one of ours; an 'origin' alone is not (Test-SharedProject in
+# sync-core.ps1 has what syncing into somebody's own repository did).
+TEAMSYNC_MARKERS = ("push-now.ps1", "TEAM-PROJECT-REFERENCE.md")
+
+
+def has_teamsync_files(path):
+    return bool(path) and any(os.path.isfile(os.path.join(path, m)) for m in TEAMSYNC_MARKERS)
+
+
+def github_origin(path):
+    """owner/name of the folder's 'origin' when it is on GitHub, else ''."""
+    url = git(path, "remote", "get-url", "origin")
+    if "github.com" not in url:
+        return ""
+    return url.rstrip("/").removesuffix(".git").split("github.com")[-1].strip(":/")
+
+
+def teamsync_refs_on(slug):
+    """Does that GitHub repository carry this app's own refs? True, False, or
+    None when GitHub could not be asked."""
+    data = gh_json("api", f"repos/{slug}/git/matching-refs/teamsync/")
+    if data is None:
+        return None
+    return bool(data)
+
+
+def find_shared_history(path):
+    """A project this app already shared - from another machine, or from an
+    earlier copy of the folder - that holds this folder's history. Its
+    owner/name, or "" when there is none, or no history to compare.
+
+    The first commit is the fingerprint: two copies of one project share it,
+    two different projects never do. Every repository this account can see is
+    asked whether it holds that commit - a few at a time, because each answer
+    is a round trip - and a match counts only if it also carries this app's
+    refs: the folder's OWN repository holds the commit too, and it is exactly
+    the one this must never mistake for a shared project.
+    """
+    roots = git(path, "rev-list", "--max-parents=0", "HEAD").split()
+    if not roots:
+        return ""
+    names = gh("api", "user/repos?per_page=100", "--paginate", "--jq", ".[].full_name")
+    slugs = [s for s in (names or "").split() if "/" in s]
+    if not slugs:
+        return ""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def holds(slug):
+        return gh("api", f"repos/{slug}/commits/{roots[0]}", "--jq", ".sha") is not None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        hits = [s for s, ok in zip(slugs, pool.map(holds, slugs)) if ok]
+    for slug in hits:
+        if teamsync_refs_on(slug):
+            return slug
+    return ""
+
+
+def share_route(path):
+    """Where "share this folder" should lead. The user's rule, 2026-10-01:
+
+    if this app already shared it - recently or long ago, from this machine or
+    another - the next person is added to THAT project. Otherwise it does not
+    matter whether the folder has git, or a GitHub repository of its own: this
+    is not publishing it, it is building a shared workspace, so a NEW private
+    repository is made for developing together.
+
+    Returns ("shared", slug) - this very folder is a shared project;
+    ("elsewhere", slug) - its history is shared as another project; or
+    ("new", ""). Network-bound: call it off the main thread.
+    """
+    has_git = os.path.isdir(os.path.join(path, ".git"))
+    slug = github_origin(path) if has_git else ""
+    if slug and (has_teamsync_files(path) or teamsync_refs_on(slug)):
+        return "shared", slug
+    if has_git:
+        hit = find_shared_history(path)
+        if hit and hit.lower() != slug.lower():
+            return "elsewhere", hit
+    return "new", ""
 
 # ------------------------------------------------------------- self-update ---
 
@@ -1685,11 +2022,13 @@ HELP = {
     ),
     'destructive': (
         "Changes waiting for your word.\n\n"
-        "Adding work needs no permission. Destroying it does - so when what is about to go out would DELETE a file, or put a file back to an older version of itself, the app stops and asks you first. Everything else keeps publishing as usual.\n\n"
+        "Adding work needs no permission. Destroying it does - so when what is about to go out would DELETE a whole file, or put a file back to an older version of itself, the app stops and asks you first. Everything else keeps publishing as usual: editing a file - adding lines, removing lines - never asks.\n\n"
+        "Moving or renaming a file does not ask either, as long as its content arrives unchanged under the new name: nothing is destroyed. Moved AND changed, or moved somewhere the project ignores, still asks.\n\n"
         "It happens by accident more often than on purpose: a file dragged to the bin, a folder restored from an old backup, an editor that saved over the newest text. Published, that removes the file or the newer wording from everybody's machine - and it used to go out with the log saying only \"pushed 1 commit(s)\".\n\n"
-        "Two answers. \"Publish these\" sends them, and they really do disappear for everyone. \"Put them back\" restores the newest version from the project's own history - nothing was ever lost, every version is here.\n\n"
+        "It looks at everything not yet sent - work on the disk, and work already committed on this machine - and at every earlier version of a file, however old.\n\n"
+        "Two answers. \"Publish these\" sends them, and they really do disappear for everyone. \"Put them back\" restores each file from the right place - the newest version on this machine, or the team's version if the damage was already committed here. Nothing was ever lost; every version is here.\n\n"
         "The confirmation covers exactly the files listed. Delete something else afterwards and you are asked again, because you have not seen that one yet.\n\n"
-        "A machine that is simply behind is never caught by this: it compares the disk against ITS OWN history, so a file it has not received yet is not a file it deleted. Signing in from a second computer is safe."
+        "A machine that is simply behind is never caught by this: it is measured from the point where this machine and the team last agreed, so a file it has not received yet is not a file it deleted. Signing in from a second computer is safe."
     ),
     'requests': (
         "Requests received.\n\n"
@@ -1720,11 +2059,11 @@ HELP = {
     'relocate': (
         "Change folder.\n\n"
         "If you moved or renamed the project folder, point the app at its new location from here.\n\n"
-        "No need to close the window or use Switch. Syncing stops at the old path and starts at the new one. Nothing is lost."
+        "No need to close the window or go Home first. Syncing stops at the old path and starts at the new one. Nothing is lost."
     ),
-    'switch': (
-        "Switch project.\n\n"
-        "Returns to the first screen so you can open a different project. Syncing of the current project is NOT stopped - it carries on in the background."
+    'home': (
+        "Home.\n\n"
+        "Back to the first screen, where you can open a different project, start a new one, or join one. Syncing of the current project is NOT stopped - it carries on in the background."
     ),
     'disconnect': (
         "Disconnect this project.\n\n"
@@ -1809,6 +2148,17 @@ class TeamPanel(ttk.Frame):
         self._hide_job = None
 
     # -- drawing ----------------------------------------------------------
+
+    def clear(self, note="checking who is here..."):
+        """Between projects: show nothing that belongs to the last one, and
+        claim nothing about this one until it has been read. ("nobody has
+        joined yet" would be a claim, and for a second it would be false.)"""
+        self.people, self.activity = [], {}
+        for widget in self.rows:
+            widget.destroy()
+        self.rows = []
+        self.summary.pack_forget()
+        self._row(note, MUTED, "")
 
     def set(self, people, activity):
         """people: [{name, ago, online}] already sorted online-first."""
@@ -2127,6 +2477,8 @@ def _repo_people(slug, me):
     # answers 403, which gh_json turns into None and this loop skips.
     invites = gh_json("api", f"repos/{slug}/invitations")
     for inv in invites or []:
+        if (inv or {}).get("expired"):
+            continue                  # dead: nobody is waiting on it any more
         login = ((inv or {}).get("invitee") or {}).get("login", "")
         if login:
             found.append((login, True))
@@ -2285,21 +2637,90 @@ def pending_invitations(force=False):
         # screen on any passing network hiccup. The caller keeps what it had.
         return None
     out = []
+    expired = {}
     for inv in data:
         repo = (inv or {}).get("repository") or {}
         full = repo.get("full_name", "")
         if not full or "/" not in full:
             continue
         owner, name = full.split("/", 1)
-        out.append({
+        item = {
             "id": inv.get("id"),
             "owner": owner,
             "name": name,
             "full": full,
             "inviter": ((inv.get("inviter") or {}).get("login") or owner),
             "private": bool(repo.get("private")),
-        })
+            "created": (inv.get("created_at") or "")[:10],
+        }
+        # GitHub keeps listing an invitation after it expires (seven days),
+        # marked "expired" - and accepting one is a trap: measured on
+        # 2026-10-01, GitHub answered the accept with success, removed the
+        # invitation, and added nobody, so the download that followed was
+        # told "repository not found". Never offered; cleared by the caller.
+        if inv.get("expired"):
+            expired[item["id"]] = item
+            continue
+        out.append(item)
+    _invite_expired.clear()
+    _invite_expired.update(expired)
     return out
+
+
+_invite_expired = {}     # id -> invitation, seen expired in GitHub's last answer
+
+
+def clear_expired_invitations():
+    """Remove, for good, every expired invitation GitHub's last answer carried.
+
+    Declining is the only door the invited side has, and for a dead invitation
+    it costs nothing: it could never be accepted. Returns the ones removed, so
+    the person can be told who once invited them - the inviter can always send
+    a fresh one.
+    """
+    removed = []
+    for inv_id, inv in list(_invite_expired.items()):
+        if decline_invitation(inv_id):
+            removed.append(inv)
+        _invite_expired.pop(inv_id, None)
+    return removed
+
+
+def sweep_sent_invitations():
+    """The other side of the same rule: delete the invitations THIS account
+    sent that have expired, on every repository it owns. Returns
+    [(owner/name, invitee, sent-on)] for the ones removed.
+
+    An expired invitation is dead on GitHub already; what it still does is sit
+    in the invited person's list looking alive (2.1.9 offered it with an
+    Accept button). Removing it at the source clears it from their screen
+    whatever version of the app they run.
+    """
+    names = gh("api", "user/repos?affiliation=owner&per_page=100", "--paginate",
+               "--jq", ".[].full_name")
+    removed = []
+    for slug in (names or "").split():
+        for inv in gh_json("api", f"repos/{slug}/invitations") or []:
+            if not (inv or {}).get("expired"):
+                continue
+            gone = gh("api", "-X", "DELETE", f"repos/{slug}/invitations/{inv.get('id')}")
+            if gone is not None:
+                removed.append((slug, ((inv.get("invitee") or {}).get("login") or "?"),
+                                (inv.get("created_at") or "")[:10]))
+    return removed
+
+
+def repo_visible(full, tries=3, wait=2.0):
+    """Can this account see that repository now? Asked right after accepting
+    an invitation, because GitHub's "accepted" was measured to mean nothing
+    when the invitation had expired. A couple of retries cover the moment it
+    takes access to settle; a definite no after them is the answer."""
+    for attempt in range(tries):
+        if gh_json("api", f"repos/{full}") is not None:
+            return True
+        if attempt + 1 < tries:
+            time.sleep(wait)
+    return False
 
 
 def _answer_invitation(invitation_id, method):
@@ -2496,10 +2917,11 @@ class SetupDialog(tk.Toplevel):
     left is where to put the folder.
     """
 
-    def __init__(self, parent, mode, cfg, invite=None):
+    def __init__(self, parent, mode, cfg, invite=None, path=None):
         super().__init__(parent)
         self.mode = mode
         self.invite = invite
+        self.preset_path = path or ""
         self.result = None
         self.title("Start a new shared project" if mode == "owner" else "Join a project")
         self.resizable(False, False)
@@ -2516,7 +2938,10 @@ class SetupDialog(tk.Toplevel):
         if mode == "owner":
             note = ("Everything in the folder, including sub-folders, is uploaded to a\n"
                     "new PRIVATE repository on your GitHub account. Only the people\n"
-                    "you invite here can see it.")
+                    "you invite here can see it.\n\n"
+                    "A folder with its own git history keeps it, and any GitHub\n"
+                    "repository it already had is left alone. A folder this app has\n"
+                    "shared before is not shared twice - the people are added to it.")
         elif invite:
             note = (f"{invite['inviter']} invited you to {invite['full']}.\n"
                     "Choosing a folder accepts the invitation and downloads the project.")
@@ -2584,7 +3009,7 @@ class SetupDialog(tk.Toplevel):
         ttk.Label(parent, text=label, font=FONT_B, foreground=FG).pack(anchor="w", pady=(8, 2))
         holder = ttk.Frame(parent)
         holder.pack(fill="x")
-        var = tk.StringVar(value="")
+        var = tk.StringVar(value=self.preset_path if pick_existing else "")
         ttk.Entry(holder, textvariable=var, font=FONT).pack(side="left", fill="x", expand=True, ipady=6)
 
         def pick():
@@ -3378,6 +3803,15 @@ class App(tk.Tk):
         self._invite_watchers = []     # windows to tell when that changes
         self._team_people = []         # everyone on this project, freshest first
         self._team_activity = {}       # {name: (3h, 24h, 7d)} - only when needed
+        # The project is READ on worker threads and only painted here. One
+        # look at a time each: a look still out is never stacked on.
+        self._poll_busy = False
+        self._partner_snap = None      # the last finished look at the team
+        self._destructive = {"deleted": [], "reverted": []}
+        self._destructive_busy = False
+        self._destructive_again = False
+        self._setting_up = False       # a share or a join is writing the folder
+        self._painted_repo = None      # whose team and holds are on screen
         clean_old_exe()
         refresh_desktop_shortcut(self.cfg)
         install_editor_extension()
@@ -3415,9 +3849,24 @@ class App(tk.Tk):
         self.after(60000, self._invite_tick)
 
         remembered = self.repo
-        if remembered and os.path.isdir(os.path.join(remembered, ".git")):
+        if (remembered and os.path.isdir(os.path.join(remembered, ".git"))
+                and has_teamsync_files(remembered)):
             self._show_project()
             self.start_sync()
+        elif remembered and os.path.isdir(remembered):
+            # Remembered, present, but not a shared project: a share that did
+            # not finish left it here (2.1.9 remembered a folder before its
+            # setup had succeeded). Opening it would only start an engine that
+            # has nothing to sync with - so start on the first screen, and say
+            # why, instead of reopening it on every start.
+            self.repo = ""
+            self.cfg.pop("last_project", None)
+            save_config(self.cfg)
+            self._show_welcome()
+            self._show_note(
+                f"The last folder opened here was never shared:\n{remembered}\n"
+                "So it is not opened. To work on it together, share it.",
+                "never_shared", remembered)
         else:
             self.repo = ""
             self._show_welcome()
@@ -3425,9 +3874,9 @@ class App(tk.Tk):
                 # A moved or renamed folder is the usual cause, and silently
                 # showing the welcome screen makes it look like the project was
                 # lost. Nothing is lost - the repository travelled with the folder.
-                self.missing_lbl.config(
-                    text=f"The last project is not at this path any more:\n{remembered}\nIf you moved the folder, use \"Open a project already on this machine\" to point at its new location. Nothing has been lost.")
-                self.missing.pack(fill="x", pady=(0, 18), before=self.welcome_actions)
+                self._show_note(
+                    f"The last project is not at this path any more:\n{remembered}\nIf you moved the folder, use \"Open a project already on this machine\" to point at its new location. Nothing has been lost.",
+                    "moved")
 
     # -- layout ------------------------------------------------------------
 
@@ -3441,8 +3890,18 @@ class App(tk.Tk):
         # nearest line inside the window.
         self.topbar = ttk.Frame(self.header)
         self.topbar.pack(fill="x", pady=(0, 10))
-        ttk.Button(self.topbar, text="Help", width=8,
-                   command=self._show_help).pack(side="left")
+        self.help_btn = ttk.Button(self.topbar, text="Help", width=8,
+                                   command=self._show_help)
+        self.help_btn.pack(side="left")
+        # Home, right beside Help: the way back to the first screen. It used
+        # to be "Switch project", down among the estate buttons - but what it
+        # does is go home, and the user's own words were that it should say
+        # so and sit next to Help. Shown only while a project is open, like
+        # everything else on this line that acts on one: on the first screen
+        # you are already home.
+        self.home_row = ttk.Frame(self.topbar)
+        button(self.home_row, "Home", self._switch).pack(side="left")
+        help_button(self.home_row, "home").pack(side="left", padx=(3, 0))
         # Beside Help on the top line, not down among the working buttons:
         # an invitation is news about the estate, not an action on today's
         # file. Like the estate strip it appears only while a project is
@@ -3463,8 +3922,6 @@ class App(tk.Tk):
         help_button(self.mgmt_row, "syncbtn").pack(side="left", padx=(3, 10))
         button(self.mgmt_row, "Add people", self._add_people).pack(side="left")
         help_button(self.mgmt_row, "addpeople").pack(side="left", padx=(3, 10))
-        button(self.mgmt_row, "Switch project", self._switch).pack(side="left")
-        help_button(self.mgmt_row, "switch").pack(side="left", padx=(3, 10))
         button(self.mgmt_row, "Disconnect", self._disconnect, danger=True).pack(side="left")
         help_button(self.mgmt_row, "disconnect").pack(side="left", padx=(3, 0))
 
@@ -3496,7 +3953,7 @@ class App(tk.Tk):
 
         right = ttk.Frame(row)
         right.pack(side="right")
-        status_row = ttk.Frame(right)
+        self.status_row = status_row = ttk.Frame(right)
         status_row.pack(anchor="e")
         self.pill = Pill(status_row)
         self.pill.pack(side="left")
@@ -3504,8 +3961,13 @@ class App(tk.Tk):
         # even though only the lower one has something to explain.
         ttk.Label(status_row, text="  ", width=3).pack(side="left", padx=(8, 0))
 
-        partner_row = ttk.Frame(right)
-        partner_row.pack(anchor="e")
+        # Who is on THIS project - so it is shown only while a project is open
+        # (_show_project / _show_welcome). On the first screen there is no team,
+        # the panel is empty, and its "?" used to sit alone under the status
+        # light, which made the whole corner look out of line - the user's
+        # words: "it is crooked, idle is not in its place". 2.1.9 had it too,
+        # unseen, because the app always opened on a project.
+        self.partner_row = partner_row = ttk.Frame(right)
         self.team = TeamPanel(partner_row, self._show_team)
         self.team.pack(side="left")
         help_button(partner_row, "partner").pack(side="left")
@@ -3555,8 +4017,12 @@ class App(tk.Tk):
         self.missing_lbl = ttk.Label(self.missing, text="", font=FONT,
                                     foreground="#ffd7d7", justify="right", anchor="e")
         self.missing_lbl.pack(fill="x")
-        button(self.missing, "Locate the folder", self._locate_missing,
-               danger=True).pack(anchor="w", pady=(10, 0))
+        # One note, two kinds of news, each with its own button - see _show_note.
+        self.missing_locate = button(self.missing, "Locate the folder", self._locate_missing,
+                                     danger=True)
+        self.missing_share = button(self.missing, "Share this folder", self._share_never_shared,
+                                    primary=True)
+        self._never_shared_path = None
 
         self.welcome_actions = ttk.Frame(self.welcome)
         self.welcome_actions.pack(anchor="w", fill="x")
@@ -3677,6 +4143,26 @@ class App(tk.Tk):
         except Exception:
             return
         self.post(lambda: self._account_ready(invites))
+        # Expired invitations, both ways: the ones waiting for THIS person,
+        # and the ones this person sent that nobody took up in time.
+        self._report_cleared(clear_expired_invitations(), [])
+        try:
+            sent = sweep_sent_invitations()
+        except Exception:
+            sent = []
+        self._report_cleared([], sent)
+
+    def _report_cleared(self, received, sent):
+        """Say what the expired-invitation sweep removed. Safe from any thread."""
+        for inv in received:
+            self.lines.put(f"removed an expired invitation to {inv['full']} from "
+                           f"{inv['inviter']}"
+                           + (f" (sent {inv['created']})" if inv.get("created") else "")
+                           + " - it could no longer be accepted; ask them for a new one")
+        for slug, who, when in sent:
+            self.lines.put(f"removed your expired invitation for {who} to {slug}"
+                           + (f" (sent {when})" if when else "")
+                           + " - nobody accepted it in time; Add people sends a new one")
 
     def _account_ready(self, invites):
         """Main-thread half of the probe: save what was learned and show it."""
@@ -3748,6 +4234,8 @@ class App(tk.Tk):
         def work():
             try:
                 invites = pending_invitations(force=force)
+                if invites is not None:
+                    self._report_cleared(clear_expired_invitations(), [])
             except Exception as exc:
                 # Network trouble is already handled inside, which returns
                 # None; anything reaching here is a fault in this program, and
@@ -3772,25 +4260,44 @@ class App(tk.Tk):
     def _show_conflicts(self):
         ConflictReportsWindow(self, self)
 
-    def refresh_destructive(self):
+    def refresh_destructive(self, urgent=True):
         """Light the button when something is being held, and only then.
 
-        Read on the main thread with plain git calls, like the other project
-        readers. It is bounded work - only files already modified or missing
-        are examined - and it runs on the same tick as the rest of the panel.
+        The looking happens on a worker thread and only the painting here. It
+        used to run on this thread, every four seconds, and on a real project
+        one look took longer than four seconds - so the next was always
+        already due and the window never answered a click again. Whatever the
+        project's size, the window now stays alive; a look that is still out
+        is not stacked on, and a request that arrives meanwhile (a "put them
+        back", a confirmation) is run as soon as it finishes, not dropped.
         """
-        if not self.repo or not os.path.isdir(self.repo):
+        repo = self.repo
+        if not repo or not os.path.isdir(repo):
             return
-        try:
-            changes = destructive_changes(self.repo)
-        except Exception:
-            return                       # a half-written tree is not an alarm
+        if self._destructive_busy:
+            if urgent:
+                self._destructive_again = True
+            return
+        self._destructive_busy = True
+
+        def work():
+            try:
+                found = read_destructive(repo)
+            except Exception:
+                found = None         # could not look: keep what was last known
+            self.post(lambda: self._destructive_done(repo, found))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _destructive_done(self, repo, found):
+        self._destructive_busy = False
+        if found is not None and repo == self.repo:
+            self._apply_destructive(*found)
+        if self._destructive_again:
+            self._destructive_again = False
+            self.refresh_destructive()
+
+    def _apply_destructive(self, changes, approved):
         held = list(changes.get("deleted", [])) + list(changes.get("reverted", []))
-        try:
-            approved = git(self.repo, "config", "--local", "--get",
-                           "teamsync.destructiveok").strip()
-        except Exception:
-            approved = ""
         # Already confirmed is not "waiting for you" - the button must not sit
         # lit after the person has answered.
         if held and approved and approved == destructive_signature(changes):
@@ -3802,6 +4309,7 @@ class App(tk.Tk):
         else:
             self.btn_destructive.configure(text="Needs your OK")
             self.btn_destructive.state(["disabled"])
+        self._paint_now()
 
     def _show_destructive(self):
         changes = getattr(self, "_destructive", None)
@@ -3846,7 +4354,9 @@ class App(tk.Tk):
 
     def _show_welcome(self):
         self.mgmt_row.pack_forget()
+        self.home_row.pack_forget()
         self.req_row.pack_forget()
+        self.partner_row.pack_forget()
         self.project.pack_forget()
         self.welcome.pack(fill="both", expand=True)
         self.caption_lbl.config(text="")
@@ -3854,15 +4364,35 @@ class App(tk.Tk):
         self.path_lbl.config(text="no project open")
         self.pill.set("idle", MUTED)
 
-    def _show_project(self):
+    def _show_project(self, remember=True):
         self.mgmt_row.pack(side="right")
-        self.req_row.pack(side="left", padx=(10, 0))
+        self.home_row.pack(side="left", padx=(10, 0), after=self.help_btn)
+        self.req_row.pack(side="left", padx=(10, 0), after=self.home_row)
+        self.partner_row.pack(anchor="e", after=self.status_row)
+        # Who is here, and what is held, belong to ONE project. Opening a
+        # different one used to leave the last project's people on screen
+        # until the next four-second look came back - the user's rule is that
+        # this corner shows the open project and nothing else. So: wipe it,
+        # say it is being read, and read it now rather than at the next tick.
+        if self.repo != self._painted_repo:
+            self._painted_repo = self.repo
+            self._partner_snap = None
+            self.team.clear()
+            self._apply_destructive({"deleted": [], "reverted": []}, "")
+            self.after_idle(self._poll_once)
         self.missing.pack_forget()
         self.welcome.pack_forget()
         self.project.pack(fill="both", expand=True)
         # Remember it the moment it is opened, not only when it was set up. Then
         # closing the window on a project always reopens on that project.
-        if self.repo:
+        #
+        # But NOT while it is still being set up. A folder whose setup failed
+        # used to be remembered anyway, as the project to reopen - measured on
+        # 2026-10-01: a share that could not complete left `worker` as the
+        # last project, so every start of the app opened a folder that was
+        # never shared, and the window froze on it. It is remembered when the
+        # setup succeeds (_finish_setup), and not before.
+        if self.repo and remember:
             before = json.dumps(self.cfg.get("projects", []), sort_keys=True)
             remember_project(self.cfg, self.repo)
             if (self.cfg.get("last_project") != self.repo
@@ -4270,8 +4800,8 @@ class App(tk.Tk):
     def _relocate(self):
         """Point this project at a folder that has moved, without restarting.
 
-        A moved folder used to mean closing the window, or Switch - and Switch can
-        leave a dead path behind. This changes the location in place: the old
+        A moved folder used to mean closing the window, or going Home - and that
+        can leave a dead path behind. This changes the location in place: the old
         engine is stopped, the new one starts where the files actually are.
         """
         old = self.repo
@@ -4280,6 +4810,12 @@ class App(tk.Tk):
             return
         if os.path.normcase(p) == os.path.normcase(old or ""):
             messagebox.showinfo(APP_NAME, "That is the current location - nothing changed.")
+            return
+        if not has_teamsync_files(p):
+            messagebox.showwarning(
+                APP_NAME, "That folder is not this project - it has none of the files "
+                          "every shared project carries (push-now.ps1, "
+                          "TEAM-PROJECT-REFERENCE.md)." + NN + p + NN + "Nothing was changed.")
             return
         self.stop_sync(quiet=True)
         # The project moved - it did not become a second project. Drop the old
@@ -4295,8 +4831,11 @@ class App(tk.Tk):
         self.start_sync()
 
     def _switch(self):
-        # Leaves the engine running: switching views is not a decision to stop
-        # syncing. Stopping is always explicit.
+        """Home: back to the first screen.
+
+        Leaves the engine running: going home is not a decision to stop
+        syncing. Stopping is always explicit.
+        """
         self.repo = ""
         self._show_welcome()
 
@@ -4399,11 +4938,38 @@ class App(tk.Tk):
                 return
         return p
 
+    def _show_note(self, text, kind, path=None):
+        """The note above the first screen's buttons, with the ONE action that
+        fits what it says.
+
+        Two kinds of news share this place but never a button. A project whose
+        folder MOVED is found again: "Locate the folder". A folder that was
+        NEVER SHARED is shared: "Share this folder". The first build of 2.2.0
+        wrote the never-shared note into the moved-folder box, and the red
+        Locate button came along with it - asking the person to go and find a
+        folder that was not lost. The user caught it on the first look and
+        asked what the button was for, which was the right question.
+        """
+        self.missing_lbl.config(text=text)
+        self.missing_locate.pack_forget()
+        self.missing_share.pack_forget()
+        self._never_shared_path = path if kind == "never_shared" else None
+        chosen = self.missing_share if kind == "never_shared" else self.missing_locate
+        chosen.pack(anchor="w", pady=(10, 0))
+        self.missing.pack(fill="x", pady=(0, 18), before=self.welcome_actions)
+
+    def _share_never_shared(self):
+        """The never-shared note's button: the share form, for that folder."""
+        if self._never_shared_path:
+            self._setup("owner", path=self._never_shared_path)
+
     def _locate_missing(self):
         """The welcome screen's shortcut for a project whose folder moved."""
         gone = self.cfg.get("last_project")
         p = self._pick_project("Where is the project now?")
         if not p:
+            return
+        if not self._is_ours_or_offer_share(p):
             return
         if gone and os.path.normcase(gone) != os.path.normcase(p):
             forget_project(self.cfg, gone)
@@ -4413,6 +4979,25 @@ class App(tk.Tk):
         save_config(self.cfg)
         self._show_project()
         self.start_sync()
+
+    def _is_ours_or_offer_share(self, path):
+        """True when the folder is a project this app set up or joined.
+
+        Otherwise it is never opened as one - opening starts the engine, and
+        the engine used to sync straight into whatever 'origin' the folder
+        had, a person's own public repository included. The way forward is
+        offered instead: sharing it makes a NEW private project.
+        """
+        if has_teamsync_files(path):
+            return True
+        if messagebox.askyesno(
+                APP_NAME,
+                "This folder is not a shared project yet:" + NN + path + NN +
+                "The app only syncs projects it set up, so it will not open this "
+                "one as it is. Share it now? That makes a new private project for "
+                "it; any repository it already has is left alone."):
+            self._setup("owner", path=path)
+        return False
 
     def _open_existing(self):
         """Show what has been opened before. Browsing is the fallback, not the ritual."""
@@ -4443,8 +5028,10 @@ class App(tk.Tk):
             path = self._pick_project("Open a project folder")
             if not path:
                 return
-        p = path
-        self.repo = os.path.normpath(p)
+        p = os.path.normpath(path)
+        if not self._is_ours_or_offer_share(p):
+            return
+        self.repo = p
         self.cfg["last_project"] = self.repo
         save_config(self.cfg)
         self._show_project()
@@ -4452,8 +5039,8 @@ class App(tk.Tk):
 
     # -- setup -------------------------------------------------------------
 
-    def _setup(self, mode, invite=None):
-        dlg = SetupDialog(self, mode, self.cfg, invite=invite)
+    def _setup(self, mode, invite=None, path=None):
+        dlg = SetupDialog(self, mode, self.cfg, invite=invite, path=path)
         self.wait_window(dlg)
         if not dlg.result:
             return
@@ -4465,6 +5052,81 @@ class App(tk.Tk):
             remember_person(self.cfg, login)
         save_config(self.cfg)
 
+        if mode == "owner":
+            # First, is this folder already shared - here or anywhere? Then
+            # the people go to THAT project and no second one is made. Asked
+            # off the main thread: it is a few round trips to GitHub.
+            folder = os.path.normpath(v["path"])
+            self.configure(cursor="watch")
+
+            def work():
+                try:
+                    route = share_route(folder)
+                except Exception:
+                    route = ("new", "")
+                self.post(lambda: self._share_routed(v, route))
+            threading.Thread(target=work, daemon=True).start()
+            return
+        self._run_setup(mode, v, invite)
+
+    def _share_routed(self, v, route):
+        self.configure(cursor="")
+        kind, slug = route
+        folder = os.path.normpath(v["path"])
+        people = list(v.get("people", []))
+        if kind == "shared":
+            # This very folder is a shared project already. Open it and add the
+            # people to it - setting it up again would make a second project
+            # for the same work.
+            self.repo = folder
+            self._show_project()
+            if not self.sync_running():
+                self.start_sync()
+            self.say(f"{os.path.basename(folder)} is already shared as {slug} - "
+                     "the people are added to it; no second project is made", "warn")
+            if people:
+                self._invite_into(slug, people)
+            return
+        if kind == "elsewhere":
+            answer = messagebox.askyesnocancel(
+                APP_NAME,
+                "This folder's history is already shared, as " + slug + NN +
+                "- set up from another machine, or from an earlier copy of this folder." + NN +
+                "Yes: add the people to " + slug + ". This folder stays exactly as it "
+                "is; to work in the shared project on this machine, join it from the "
+                "first screen." + NN +
+                "No: make a separate, new shared project from this folder anyway." + NN +
+                "Cancel: do nothing.")
+            if answer is None:
+                return
+            if answer:
+                if people:
+                    self._invite_into(slug, people, box=True)
+                else:
+                    messagebox.showinfo(APP_NAME, "Nobody was ticked, so nobody was invited.")
+                return
+        self._run_setup("owner", v, None)
+
+    def _invite_into(self, slug, people, box=False):
+        """Invite people to an existing project, off the main thread."""
+        def work():
+            allowed = repo_admin(slug)
+            if allowed:
+                said = [invite_to_repo(slug, login)[1] for login in people]
+            elif allowed is None:
+                said = ["GitHub could not be reached - nobody was invited. Try again in a moment."]
+            else:
+                said = [f"Only the person who created {slug} can add people to it - ask them."]
+
+            def show():
+                for line in said:
+                    self.say(line, "warn")
+                if box:
+                    messagebox.showinfo(APP_NAME, "\n".join(said))
+            self.post(show)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _run_setup(self, mode, v, invite):
         script = resource_path("engine", "init-owner.ps1" if mode == "owner" else "init-friend.ps1")
         cmd = [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-NoWatch"]
         if mode == "owner":
@@ -4483,7 +5145,11 @@ class App(tk.Tk):
             cmd += ["-MyEmail", v["email"]]
 
         self.repo = os.path.normpath(v["path"])
-        self._show_project()
+        # Shown, so the setup's own messages can be read as they come - but
+        # not remembered until it has succeeded (see _show_project), and not
+        # read by the four-second tick while the setup is still writing it.
+        self._setting_up = True
+        self._show_project(remember=False)
         self.say("setting up...", "warn")
         self.pill.set("setting up", WARN)
         threading.Thread(target=self._finish_setup, args=(cmd, invite), daemon=True).start()
@@ -4500,10 +5166,21 @@ class App(tk.Tk):
             return True
         self.lines.put(f"accepting the invitation to {invite['full']}...")
         if accept_invitation(invite["id"]):
-            self.lines.put("invitation accepted")
             # Off the count immediately - it is no longer waiting, whatever
             # the download does next.
             self.drop_invitation(invite["id"])
+            # "Accepted" is not proof of access. Measured 2026-10-01: an
+            # invitation that had expired was "accepted" with a success
+            # answer, vanished, and added nobody - and the download then
+            # said "you have probably not accepted the invitation yet", two
+            # seconds after this very line had accepted it. Look first.
+            if not repo_visible(invite["full"]):
+                self.lines.put(
+                    f"GitHub took the answer but gave no access to {invite['full']}. "
+                    f"The invitation had most likely expired - they last seven days. "
+                    f"Ask {invite['inviter']} to invite you again; nothing was downloaded.")
+                return False
+            self.lines.put("invitation accepted")
             return True
         self.lines.put("GitHub would not accept the invitation. It may have been "
                        "withdrawn, or already taken on github.com.")
@@ -4513,24 +5190,46 @@ class App(tk.Tk):
         return False
 
     def _finish_setup(self, cmd, invite=None):
+        # Runs on a worker thread: everything that touches the window or the
+        # config goes back to the main thread through post().
         if not self._finish_setup_prelude(invite):
+            self.post(self._setup_failed)
             return
         code = self._run_and_log(cmd)
         if code == 0 and os.path.isdir(os.path.join(self.repo, ".git")):
-            self.cfg["last_project"] = self.repo
-            save_config(self.cfg)
-            self.lines.put("setup finished - starting sync")
-            self.after(200, self.start_sync)
+            self.post(self._setup_succeeded)
             # The new project brings new people with it, and the invitation
             # just taken is no longer waiting. Re-ask rather than guess.
             threading.Thread(target=self._probe_account, daemon=True).start()
         else:
             self.lines.put("setup did not finish. Read the messages above.")
+            self.post(self._setup_failed)
+
+    def _setup_succeeded(self):
+        """Only now is the folder a project worth reopening."""
+        self._setting_up = False
+        remember_project(self.cfg, self.repo)
+        self.cfg["last_project"] = self.repo
+        save_config(self.cfg)
+        self.lines.put("setup finished - starting sync")
+        self.start_sync()
+
+    def _setup_failed(self):
+        # Nothing was remembered, so the next start of the app does not come
+        # back here. The messages stay on screen; Home leads away.
+        self._setting_up = False
+        self.pill.set("not shared - setup did not finish", BAD)
 
     # -- status ------------------------------------------------------------
 
     def _poll_git(self):
+        """The four-second tick. One chain of these runs for the life of the
+        window; anything that wants a look NOW calls _poll_once, never this,
+        or it would start a second chain."""
         self.after(4000, self._poll_git)
+        self._poll_once()
+
+    def _poll_once(self):
         if self.repo and not os.path.isdir(self.repo):
             # Moved or deleted while open. Fall back to the welcome screen and
             # explain, rather than showing a project that is not there.
@@ -4538,19 +5237,51 @@ class App(tk.Tk):
             self.repo = ""
             self.say(f"the project folder is no longer at {gone}", "bad")
             self._show_welcome()
-            self.missing_lbl.config(
-                text=f"The project folder is no longer at this path:\n{gone}\nUse \"Open a project already on this machine\" to point at its new location.")
-            self.missing.pack(fill="x", pady=(0, 18), before=self.welcome_actions)
+            self._show_note(
+                f"The project folder is no longer at this path:\n{gone}\nUse \"Open a project already on this machine\" to point at its new location.",
+                "moved")
             return
         if not self.repo or not os.path.isdir(os.path.join(self.repo, ".git")):
+            return
+        # Nothing to read until the folder IS a shared project: not while a
+        # setup is still writing it, and not after one that did not finish.
+        if self._setting_up or not has_teamsync_files(self.repo):
+            return
+        # Held destructive changes ride the same tick, on their own worker.
+        # The engine has already refused to publish them; without this the
+        # person would only learn it from the log, the one place a paused
+        # publish is easy to miss. Not urgent: if a look is still out, the
+        # next tick starts the next one - only a person's own request (put
+        # back, confirm) queues one straight after.
+        self.refresh_destructive(urgent=False)
+        # Everything else is READ on a worker thread too and only painted
+        # here. These reads used to run on this thread - a dozen git processes
+        # every four seconds - and the window is the one thing that must
+        # never wait on git.
+        if self._poll_busy:
+            return
+        self._poll_busy = True
+        repo = self.repo
+
+        def work():
+            try:
+                snap = read_project_state(repo)
+            except Exception:
+                snap = None
+            self.post(lambda: self._poll_done(repo, snap))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_done(self, repo, snap):
+        self._poll_busy = False
+        if snap is None or repo != self.repo:
             return
         # Before the conflict check, not after it. A conflict of our own used
         # to freeze this display for as long as it lasted, so the teammate
         # who was still working looked frozen too - and their own conflict
         # warning could never appear here.
-        self._refresh_partner()
+        self._apply_partner(snap)
 
-        unmerged = git(self.repo, "diff", "--name-only", "--diff-filter=U")
+        unmerged = snap["unmerged"]
         if unmerged:
             n = len(unmerged.splitlines())
             self.banner.pack(fill="x", padx=18, pady=(0, 10), before=self.log.master)
@@ -4573,8 +5304,8 @@ class App(tk.Tk):
             self.btn_sync.config(text="Start sync")
             return
         self.btn_sync.config(text="Stop sync")
-        ahead = git(self.repo, "rev-list", "--count", "origin/main..HEAD") or "0"
-        if daemon_state(self.repo).get("net") == "offline":
+        ahead = snap["ahead"] or "0"
+        if snap["net"] == "offline":
             # Offline is not a failure state: work is committed locally and the
             # engine keeps retrying. Say that, rather than just showing a number.
             waiting = f" - {ahead} waiting" if ahead != "0" else ""
@@ -4588,35 +5319,45 @@ class App(tk.Tk):
         TeamWindow(self, self._team_people, self._team_activity)
 
     def _refresh_partner(self):
-        """Who is here: green now, grey earlier, and nobody named twice."""
-        # Held destructive changes ride the same tick. The engine has already
-        # refused to publish them; without this the person would only learn it
-        # from the log, which is the one place a paused publish is easy to miss.
-        self.refresh_destructive()
-        me = my_own_names(self.repo)
-        self._team_people = team_presence(self.repo, me)
-        # Only asked for when it could change the answer - the ranking exists
-        # to choose ten out of more than ten, and it caches for a minute
-        # anyway. A four-person project never pays for it.
-        self._team_activity = (recent_activity(self.repo)
-                               if len([p for p in self._team_people if p["online"]]) > TeamPanel.HOVER_MAX
-                               else {})
-        self.team.set(self._team_people, self._team_activity)
+        """Who is here: green now, grey earlier, and nobody named twice.
 
-        # Everything that is TRUE RIGHT NOW goes into the column, one row per
-        # person. Conflicts first: a file somebody is untangling is the one
-        # file where another change from here makes their job harder and
-        # probably causes the next conflict. Their repository is fine and
-        # nothing is blocked - this is knowledge, not a lock. Then who is
-        # holding what, named per person rather than pooled: with two people
-        # "somebody is editing this" could only mean one person, and with five
-        # it answers a question nobody asked.
+        Reads and paints in one go, on whatever thread calls it - kept for a
+        caller that needs the answer now. The tick itself goes through
+        read_project_state on a worker and _apply_partner here.
+        """
+        self.refresh_destructive()
+        self._apply_partner(read_partner_state(self.repo))
+
+    def _apply_partner(self, snap):
+        """Paint the team corner and the 'Right now' column from one look."""
+        self._partner_snap = snap
+        self._team_people = snap["people"]
+        self._team_activity = snap["activity"]
+        self.team.set(self._team_people, self._team_activity)
+        self._paint_now()
+
+    def _paint_now(self):
+        """Everything that is TRUE RIGHT NOW goes into the column, one row per
+        person. Conflicts first: a file somebody is untangling is the one
+        file where another change from here makes their job harder and
+        probably causes the next conflict. Their repository is fine and
+        nothing is blocked - this is knowledge, not a lock. Then who is
+        holding what, named per person rather than pooled: with two people
+        "somebody is editing this" could only mean one person, and with five
+        it answers a question nobody asked. Last, what is waiting for this
+        person's own word.
+
+        Called whenever either half arrives - the team's look or the
+        destructive check, which run on separate workers - from the last
+        answer of each.
+        """
+        snap = self._partner_snap or {}
         rows = []
-        for who, files in team_conflicts(self.repo, me).items():
+        for who, files in (snap.get("conflicts") or {}).items():
             rows.append((BAD, "%s is resolving a conflict" % who, files))
-        for who, files in team_pending_files(self.repo, me).items():
+        for who, files in (snap.get("pending") or {}).items():
             rows.append((WARN, "%s is working on" % who, files))
-        held = getattr(self, "_destructive", None) or {}
+        held = self._destructive or {}
         n_held = len(held.get("deleted", [])) + len(held.get("reverted", []))
         if n_held:
             rows.append((BAD, "waiting for your word",

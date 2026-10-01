@@ -52,20 +52,27 @@ below. Exit 3 = this would destroy work, see below.
 ## Exit 3 - it would delete or roll back somebody's work
 
 Adding work needs no permission. Destroying it does. If what you are about to
-publish DELETES a file, or puts a file back to an older version of itself,
+publish DELETES a file, or puts a file back to ANY older version of itself,
 push-now stops and names the files. Nothing was pushed and nothing is lost.
+Editing inside a file never stops it, nor does a move or rename that keeps
+the content unchanged; moving AND changing a file in one go does - so move
+first, publish, then edit, when the move is deliberate.
+It looks at work already committed on this machine as well as work on the
+disk, so committing first changes nothing.
 
 This is not a failure to work around. **It is a decision for your human, and
 never yours** - published, it removes that file, or that newer wording, from
 every teammate's machine.
 
-- If it was a mistake, put it back: `git checkout -- <file>`, then run
-  push-now again.
-- If your human really means it, they confirm it in the TeamSync window
-  ("Needs your OK"), and then push-now goes through.
+- To see what is held without publishing anything, run push-now with
+  `-CheckOnly`.
+- If it was a mistake, your human presses "Put them back" in the TeamSync
+  window ("Needs your OK"); then run push-now again.
+- If your human really means it, they confirm it in the same window
+  ("Publish these"), and then push-now goes through.
 
-Do NOT `git rm`, `git checkout` your way past it, or edit the config that
-records the confirmation. Report what was named, and wait.
+Do NOT `git rm`, `git commit` or `git checkout` your way past it, or edit the
+config that records the confirmation. Report what was named, and wait.
 
 ## Conflicts
 

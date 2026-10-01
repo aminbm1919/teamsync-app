@@ -15,6 +15,15 @@
 $ErrorActionPreference = 'Continue'
 Set-Location -LiteralPath $PSScriptRoot
 
+# Git prints UTF-8, but Windows PowerShell decodes what a program prints with
+# the CONSOLE's code page - 437 or 720 on most machines - so a Persian file
+# name was listed here as box-drawing garbage. Read git as UTF-8 while this
+# runs, and give the console its own setting back afterwards.
+$script:ConsoleEncodingWas = $null
+try { $script:ConsoleEncodingWas = [Console]::OutputEncoding } catch { }
+try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } catch { }
+try {
+
 # Git escapes non-ASCII paths in its output unless told not to, so a Persian
 # or Arabic file name would be listed here as "\331\201..." - unreadable, and
 # never equal to the same file's name anywhere else.
@@ -139,3 +148,7 @@ if ($mine.Count -eq 0) {
 }
 Write-Host ''
 exit 0
+
+} finally {
+    if ($script:ConsoleEncodingWas) { try { [Console]::OutputEncoding = $script:ConsoleEncodingWas } catch { } }
+}

@@ -36,7 +36,8 @@ agent may propose a split, never enact one.
 
 Everybody here publishes under a different `git config user.name`; that name is
 what ties presence, file warnings and authorship together. One person on two
-machines is fine and gets a number automatically (`amin`, `amin-2`).
+machines is fine: one GitHub account is one name, however many machines it
+works from, and the team sees one person.
 
 ## Project notes
 

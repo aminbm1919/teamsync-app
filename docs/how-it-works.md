@@ -34,8 +34,10 @@ The buttons
                    never fewer than the last 100 lines
   Conflicts        everything stuck on the project, whoever it belongs to
   Add people       invite more people to this project, later than day one
-  Switch project   another shared project
   Disconnect       remove this project from the app; files and GitHub stay
+  Home             (top line, beside Help) back to the first screen - to open
+                   another project, share a folder, or join one; syncing of
+                   this project carries on
 
 Publishing
   Work is committed the moment it is saved, published when you press the
