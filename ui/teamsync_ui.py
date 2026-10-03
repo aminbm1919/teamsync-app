@@ -17,6 +17,7 @@ Disconnect) - never a side effect of closing a window.
 """
 
 import ctypes
+import hashlib
 import json
 import os
 import queue
@@ -40,7 +41,7 @@ APP_NAME = "TeamSync"
 # and third are single digits, so the line runs 2.1.0 ... 2.1.9, then 2.2.0,
 # on to 2.9.9, and then 3.0.0. publish-release.ps1 refuses anything else, so
 # the rule cannot be broken by forgetting it.
-APP_VERSION = "2.2.1"           # compared against the newest release tag
+APP_VERSION = "2.2.2"           # compared against the newest release tag
 UPDATE_REPO = "aminbm1919/teamsync-app"   # public since 2026-08-28: source and releases
 # The app ships as a folder, not a single file. A one-file build unpacks ~970
 # files into %TEMP% on every launch, and on a machine whose antivirus interferes
@@ -275,6 +276,40 @@ def engine_script():
     return resource_path("engine", "teamsync.ps1")
 
 
+_FINGERPRINTS = {}
+
+
+def engine_fingerprint(script=None):
+    """Which build of the engine this is - its CODE, not its version label.
+
+    Two builds can carry one version number, and a label cannot tell them
+    apart. Found 2026-10-03: a project's engine came from the first build of
+    2.2.1 and ran that build's code under the second for a day and a half,
+    because both said "2.2.1". The engine hashes the same files when it starts
+    (Get-EngineBuild in sync-core.ps1) and writes the result in its heartbeat:
+    the first 12 hex digits of SHA-256 over the engine script and then the
+    sync-core.ps1 beside it, the bytes as they are on disk. '' if unreadable.
+    """
+    script = script or engine_script()
+    core = os.path.join(os.path.dirname(script), "sync-core.ps1")
+    try:
+        stamp = (script, os.path.getmtime(script),
+                 os.path.getmtime(core) if os.path.isfile(core) else 0)
+    except OSError:
+        return ""
+    if stamp not in _FINGERPRINTS:
+        h = hashlib.sha256()
+        try:
+            for path in (script, core):
+                if path == script or os.path.isfile(path):
+                    with open(path, "rb") as fh:
+                        h.update(fh.read())
+        except OSError:
+            return ""
+        _FINGERPRINTS[stamp] = h.hexdigest()[:12]
+    return _FINGERPRINTS[stamp]
+
+
 def engine_command(repo):
     """The one command every engine is started with: this copy's engine,
     told which build it is - the version its heartbeat then carries."""
@@ -499,6 +534,16 @@ def clear_stop_request(repo):
         pass
 
 
+def stop_requested(repo):
+    """Is the person's stop waiting for repo's engine - asked, and not taken
+    yet? A replacement's "restart" is not the person's word."""
+    try:
+        with open(_stop_request_path(repo), encoding="ascii", errors="replace") as fh:
+            return fh.read().strip() == "stop"
+    except OSError:
+        return False
+
+
 def engines_on_machine(script):
     """{project folder: pid} for every engine on this machine running `script`.
 
@@ -593,10 +638,26 @@ def stale_engines(listed):
         pid = _engine_pid(path) if os.path.isdir(path) else None
         if pid is None:
             continue
-        if (daemon_state(path).get("version", "") != APP_VERSION
-                or engine_serves(pid, path) is False):
+        if not engine_current(path, pid)[0]:
             stale.append(path)
     return stale
+
+
+def engine_current(repo, pid):
+    """Is this engine this build's, working on this folder? (True, '') or
+    (False, why): 'version' - another version; 'build' - this version, but
+    another build of it (its code differs: see engine_fingerprint); 'place' -
+    it works on another folder (this one's old place). An engine from before
+    2.2.2 names no build and is judged by its version alone."""
+    state = daemon_state(repo)
+    if state.get("version", "") != APP_VERSION:
+        return False, "version"
+    build = state.get("build", "")
+    if build and build != engine_fingerprint():
+        return False, "build"
+    if engine_serves(pid, repo) is False:
+        return False, "place"
+    return True, ""
 
 
 def unlisted_engines(cfg):
@@ -692,11 +753,23 @@ class Engines:
     # -- starting ----------------------------------------------------------
 
     def start(self, repo):
-        """Start repo's engine now - it was opened, and none runs there."""
+        """Start repo's engine now - it was opened, or left syncing, and none
+        runs there. One this app already started there and still running is
+        returned instead: the window opening a project and the startup resume
+        can reach for the same one at the same moment, and two engines on one
+        worktree is the one thing git cannot survive."""
+        key = _engine_key(repo)
         with self._lock:
+            entry = self._procs.get(key)
+            if entry is not None and entry[0].poll() is None and _same_folder(entry[1], repo):
+                return entry[0]
             proc = launch_engine(repo)
-            self._procs[_engine_key(repo)] = (proc, repo)
+            self._procs[key] = (proc, repo)
         return proc
+
+    def is_closing(self):
+        with self._lock:
+            return self._closing
 
     def claim(self, repo):
         """Reserve repo for one replacement. False when one is already under
@@ -834,7 +907,8 @@ class Engines:
         same. Returns (outcome, old version, detail):
 
           restarted - the old engine is gone, and the new one's own heartbeat
-                      says this version
+                      says this version and build; detail says why it was
+                      replaced (engine_current: version, build or place)
           started   - (start_anyway) the old one had gone by itself; a new one
                       was started, and says this version
           busy      - it never came to rest within `wait` seconds, so it was
@@ -864,8 +938,10 @@ class Engines:
         pid = _engine_pid(repo)
         old = daemon_state(repo).get("version", "") if pid else ""
         ended = None
+        why = ""
         if pid:
-            if old == APP_VERSION and engine_serves(pid, repo) is not False:
+            current, why = engine_current(repo, pid)
+            if current:
                 return "current", old, ""
             if not os.path.isfile(engine_script()):
                 return "failed", old, "this copy's engine file is missing"
@@ -901,7 +977,8 @@ class Engines:
                 job["swapping"] = False
                 self._changed.notify_all()
         done = "restarted" if ended == "ended" else "started"
-        # "Replaced" means the new engine says so itself, in its own heartbeat.
+        # "Replaced" means the new engine says so itself, in its own heartbeat:
+        # this version, this build, this folder.
         give_up = time.time() + up
         while time.time() < give_up:
             with self._lock:
@@ -909,9 +986,8 @@ class Engines:
                     return "cancelled", old, ""
             if proc.poll() is not None:
                 return "died", old, f"exit code {proc.returncode}"
-            if (daemon_pid(repo) == proc.pid
-                    and daemon_state(repo).get("version", "") == APP_VERSION):
-                return done, old, ""
+            if daemon_pid(repo) == proc.pid and engine_current(repo, proc.pid)[0]:
+                return done, old, why
             time.sleep(0.25)
         return "slow", old, ""
 
@@ -2110,6 +2186,36 @@ def read_project_state(repo):
     return snap
 
 
+# The engine's conflict exports under _conflicts: named by their moment, with
+# -02, -03 for a second that already had one (New-ExportFolder in
+# sync-core.ps1). Crossed-edits keepsakes (-crossed) and teammates' reports
+# saved from the Conflicts window (<name>-report) live beside them.
+_EXPORT_NAME = re.compile(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:-(\d+))?")
+
+
+def newest_conflict_export(repo):
+    """The folder of the newest conflict export, or None.
+
+    It used to be the last folder of ALL in name order - whatever sorted last:
+    a teammate's report saved here (letters sort after digits), or a
+    crossed-edits keepsake. So the conflict button opened those instead of
+    the copies of the conflict at hand. push-now keeps the same rule."""
+    croot = os.path.join(repo, "_conflicts")
+    try:
+        names = os.listdir(croot)
+    except OSError:
+        return None
+    best, key = None, None
+    for name in names:
+        m = _EXPORT_NAME.fullmatch(name)
+        if not m or not os.path.isdir(os.path.join(croot, name)):
+            continue
+        k = (name[:19], int(m.group(1) or 1))
+        if key is None or k > key:
+            best, key = name, k
+    return os.path.join(croot, best) if best else None
+
+
 def seen_phrase(ago_seconds):
     """When the partner was last here, said the way a person would.
 
@@ -2278,6 +2384,60 @@ def forget_project(cfg, path):
     path = os.path.normcase(os.path.normpath(path))
     cfg['projects'] = [e for e in cfg.get('projects', [])
                        if os.path.normcase(e.get('path', '')) != path]
+
+
+def _project_entry(cfg, path):
+    key = os.path.normcase(os.path.normpath(path or ""))
+    for entry in cfg.get("projects", []):
+        if os.path.normcase(os.path.normpath(entry.get("path", ""))) == key:
+            return entry
+    return None
+
+
+def sync_intent(cfg, path):
+    """Did the person leave this project syncing? True, False, or None when
+    nothing is recorded - a project the list does not hold, or one last
+    touched by a version before 2.2.2.
+
+    The person's word, kept: Start sync, a project shared or joined, or an
+    engine found running set it; only Stop sync clears it. A restart of the
+    app - or of the whole machine, which ends every engine - goes by it: the
+    user's ruling of 2026-10-03, "every project that was syncing carries on",
+    and its other half, a project they stopped stays stopped.
+    """
+    entry = _project_entry(cfg, path)
+    if entry is None or "sync" not in entry:
+        return None
+    return bool(entry["sync"])
+
+
+def set_sync_intent(cfg, path, on):
+    """Record it on the project's entry. True if that changed anything, so
+    the caller knows to save."""
+    entry = _project_entry(cfg, path)
+    if entry is None or entry.get("sync") is bool(on):
+        return False
+    entry["sync"] = bool(on)
+    return True
+
+
+def turned_off(cfg, path):
+    """Did the person turn syncing of this project off? Their recorded word
+    (sync_intent) - or, where none is recorded, a stop they asked of its
+    engine that it has not taken yet: by a version before 2.2.2, or for a
+    project taken off the list together with its syncing.
+
+    A stop rides on a request the engine reads at its next rest, and the
+    request outlives the app - so the app can be closed, or updated, before
+    the engine has read it. The next start used to take such a stop back:
+    the window "reconnected" to the engine still running, and the startup
+    sweep replaced an older one by a fresh engine. Found 2026-10-03 while
+    writing 2.2.2: Stop sync, then an update straight away, and the project
+    was syncing again on the new version (test_engine_resume, section 7)."""
+    intent = sync_intent(cfg, path)
+    if intent is not None:
+        return not intent
+    return stop_requested(path)
 
 
 # The files this app plants in every shared project, tracked in its history -
@@ -3136,7 +3296,8 @@ HELP = {
         "For later days, or for moving between several shared projects. Pick the project folder itself - the one containing .git - not the folder above it.\n\n"
         "A project that is still syncing but is not on the list - removed from it earlier, say - is shown too, marked \"syncing - not on your list\", so you can open it again or stop it.\n\n"
         "Removing a project that is still syncing asks whether its syncing should stop too.\n\n"
-        "You rarely need this: the app reopens your last project on its own."
+        "Opening a project you turned off keeps it off until you press Start sync.\n\n"
+        "You rarely need this: the app reopens your last project on its own, and every project that was syncing carries on by itself."
     ),
     'publish': (
         "Publish now.\n\n"
@@ -3146,8 +3307,8 @@ HELP = {
     ),
     'syncbtn': (
         "Turn syncing on or off.\n\n"
-        "Off means nothing is sent and nothing is received until you turn it on again. Your work stays safe in local commits either way.\n\n"
-        "Turning it off takes a few seconds, and the button says Stopping... meanwhile: the engine first finishes what it is in the middle of. A git command cut off halfway can leave the project stuck for the next engine.\n\n"
+        "Off means nothing is sent and nothing is received until you turn it on again - and it stays off when the app or the whole machine restarts. Your work stays safe in local commits either way.\n\n"
+        "Turning it off takes a few seconds, and the button says Stopping... meanwhile: the engine first finishes what it is in the middle of. A git command cut off halfway can leave the project stuck for the next engine. Close or update the app in those seconds and the stop still happens - the next start finishes it, never undoes it.\n\n"
         "Closing the window does NOT turn syncing off - the engine keeps running in the background. This button and Disconnect are the only off switches."
     ),
     'openfolder': (
@@ -3192,7 +3353,7 @@ HELP = {
     ),
     'autostart': (
         "Start with Windows.\n\n"
-        "When on, TeamSync opens itself after every login and carries on syncing your last project.\n\n"
+        "When on, TeamSync opens itself after every login and carries on syncing every project that was syncing - not only the last one. A project you turned off stays off.\n\n"
         "Nothing runs while the machine is off, but nothing is lost either: unpublished work waits in local commits and both sides line up again once you are back."
     ),
 }
@@ -5865,7 +6026,7 @@ class App(tk.Tk):
         #
         # But NOT while it is still being set up. A folder whose setup failed
         # used to be remembered anyway, as the project to reopen - measured on
-        # 2026-10-01: a share that could not complete left `worker` as the
+        # 2026-10-01: a share that could not complete left that folder as the
         # last project, so every start of the app opened a folder that was
         # never shared, and the window froze on it. It is remembered when the
         # setup succeeds (_finish_setup), and not before.
@@ -6016,37 +6177,46 @@ class App(tk.Tk):
             return
         if ENGINES.replacing(repo):
             # The startup sweep is already moving this engine onto this build.
+            self._keep_intent(repo, True)
             self.say("the sync engine is being restarted on " + latin(APP_VERSION)
                      + " - it carries on in a moment", "warn")
             self._paint_sync_button()
             return
         ours = ENGINES.ours(repo)
         pid = None if ours is not None else daemon_pid(repo)
+        if ours is None and pid is not None and turned_off(self.cfg, repo):
+            # The person turned it off, and the engine still running is that
+            # stop on its way - asked before the app was closed or updated,
+            # not read yet. Carried through, never taken back (turned_off).
+            self._carry_stop(repo)
+            return
         if ours is not None or pid is not None:
             # An engine from a previous window is still covering this folder -
             # but an engine deliberately outlives windows, which means it can
             # outlive UPDATES and keep running last week's code with none of
             # the new behavior, silently. Field-found: a leftover engine ran
-            # 2.0.7 rules under a 2.0.15 app. Same version: adopt it. Any
-            # other answer (or none - engines before 2.0.16 did not say):
-            # replace it with one running this build's code. One this app
-            # started itself is this build by construction, heartbeat or not.
-            # And a heartbeat that came along with a MOVED folder vouches for
-            # an engine still working on the old path: replaced too.
-            serves = True if ours is not None else engine_serves(pid, repo)
-            running = (APP_VERSION if ours is not None
-                       else daemon_state(repo).get("version", ""))
-            if running == APP_VERSION and serves is not False:
-                # A stop asked for earlier and not yet taken - before the app
-                # was closed, say - is taken back: opening a project has always
-                # meant syncing it.
+            # 2.0.7 rules under a 2.0.15 app. This version, this build, this
+            # folder: adopt it. Anything else - an engine before 2.0.16 says
+            # no version at all - is replaced with one running this build's
+            # code. One this app started itself is current by construction,
+            # heartbeat or not. A heartbeat that came along with a MOVED folder
+            # vouches for an engine still working on the old path: replaced too.
+            current, why = (True, "") if ours is not None else engine_current(repo, pid)
+            self._keep_intent(repo, True)       # it runs: this project is syncing
+            if current:
+                # A replacement's request left behind - the app went before
+                # the engine read it - is taken back: this engine is current.
+                # (The person's stop never reaches here: turned_off, above.)
                 withdraw_stop_request(repo)
                 self.say("sync engine already running in the background - reconnected", "ok")
                 self._paint_sync_button()
                 return
-            if serves is False:
+            if why == "place":
                 self.say("this folder was moved while its engine ran - that engine "
                          "stops at its old place, and syncing starts here", "warn")
+            elif why == "build":
+                self.say("engine was running an earlier build of " + latin(APP_VERSION)
+                         + " - restarting it on this one", "warn")
             else:
                 self.say("engine was running older code - restarting it on "
                          + latin(APP_VERSION), "warn")
@@ -6057,6 +6227,16 @@ class App(tk.Tk):
                 threading.Thread(target=self._replace_worker, args=(repo, True),
                                  daemon=True).start()
             self._paint_sync_button()
+            return
+        # Nothing runs here. A project the person turned off stays off - after
+        # a restart of the app or of the machine as much as after going Home -
+        # until they turn it on: Start sync records that before it calls this.
+        if turned_off(self.cfg, repo):
+            self._keep_intent(repo, False)      # a stop asked before 2.2.2: kept
+            self.say("syncing of this project is off - you turned it off; "
+                     "Start sync turns it on again", "warn")
+            self._paint_sync_button()
+            self.pill.set("stopped", MUTED)
             return
         if not os.path.exists(engine_script()):
             explain('The sync engine could not be found.',
@@ -6070,11 +6250,20 @@ class App(tk.Tk):
                     f'Windows refused: {exc}',
                     'Close the app and open it again. If it repeats, check that git is installed - run  git --version  in a terminal.')
             return
+        self._keep_intent(repo, True)
         self._paint_sync_button()
         self.pill.set("syncing", ACCENT)
         self.say("sync engine started", "ok")
 
+    def _keep_intent(self, repo, on):
+        """Record whether the person left this project syncing (sync_intent)."""
+        if repo and set_sync_intent(self.cfg, repo, on):
+            save_config(self.cfg)
+
     def stop_sync(self, quiet=False, then=None):
+        # The person turned it off: it stays off - across a restart of the
+        # app, or of the machine - until they turn it on again.
+        self._keep_intent(self.repo, False)
         self._stop_project(self.repo, quiet=quiet, then=then)
 
     def _stop_project(self, repo, quiet=False, then=None):
@@ -6142,23 +6331,84 @@ class App(tk.Tk):
         so this runs after every update as well. All the looking and waiting
         happens off this thread; the window only prints the result.
 
-        A project whose engine is not running is left exactly so: the person
-        turned it off, or never turned it on.
+        And every project the person LEFT syncing gets its engine back if none
+        runs - the user's ruling of 2026-10-03: a restart of the machine ends
+        every engine, and each project that was syncing carries on, not only
+        the last one opened. One they turned off stays off (turned_off), and
+        an engine still running there is their stop on its way: carried
+        through, never replaced. An engine found running where nothing is
+        recorded marks its project as syncing: that is how the first start of
+        2.2.2 learns what was on.
         """
-        listed = [e.get("path", "") for e in self.cfg.get("projects", [])]
+        listed = [e.get("path", "") for e in self.cfg.get("projects", []) if e.get("path")]
         threading.Thread(target=self._sweep_worker, args=(listed,), daemon=True).start()
 
     def _sweep_worker(self, listed):
+        """Worker thread: only the slow look - which engines run older code.
+        What is done about it is decided on the main thread (_after_sweep),
+        where the person's own Stop and Start run: a decision taken here
+        could be overtaken by a Stop pressed meanwhile, and bring an engine
+        back behind it."""
         try:
             stale = stale_engines(listed)
         except Exception as exc:
             self.lines.put(f"could not check the sync engines of the other projects: {exc}")
-            return
+            stale = []
+        self.post(lambda: self._after_sweep(stale))
+
+    def _after_sweep(self, stale):
+        """Main thread: replace, carry a stop through, resume - per project."""
         for repo in stale:
-            # A project the window has just opened may already be under way.
-            if ENGINES.claim(repo):
+            if turned_off(self.cfg, repo):
+                self._carry_stop(repo)
+            elif ENGINES.claim(repo):   # the window may have just begun on it
                 threading.Thread(target=self._replace_worker, args=(repo,),
                                  daemon=True).start()
+        seen, changed = set(), False
+        for entry in list(self.cfg.get("projects", [])):
+            path = entry.get("path", "")
+            try:
+                if (not path or not os.path.isdir(os.path.join(path, ".git"))
+                        or not has_teamsync_files(path)):
+                    continue        # moved, removed, or not ours: nothing to resume
+                key = _engine_key(path)
+                if key in seen:
+                    continue        # one folder listed twice is one project
+                seen.add(key)
+                if ENGINES.running(path):
+                    if ENGINES.stopping(path) or ENGINES.replacing(path):
+                        continue
+                    if turned_off(self.cfg, path):
+                        self._carry_stop(path)
+                    elif sync_intent(self.cfg, path) is None:
+                        changed = set_sync_intent(self.cfg, path, True) or changed
+                    continue
+                if sync_intent(self.cfg, path) is True and not ENGINES.is_closing():
+                    ENGINES.start(path)
+                    name = os.path.basename(path.rstrip("\\/")) or path
+                    self.say(f"resumed syncing of {name} - it was left syncing", "ok")
+            except Exception as exc:
+                self.say(f"could not resume syncing of {path}: {exc}", "warn")
+        if changed:
+            save_config(self.cfg)
+        if self.repo:
+            self._paint_sync_button()
+
+    def _carry_stop(self, repo):
+        """An engine still running on a project the person turned off is their
+        stop on its way, not read yet (turned_off). It goes through - at rest,
+        as every stop - and nothing takes it back or starts a fresh engine."""
+        if ENGINES.stopping(repo):
+            return
+        self._keep_intent(repo, False)          # a stop asked before 2.2.2: kept
+        name = os.path.basename(repo.rstrip("\\/")) or repo
+        self.say(f"you turned syncing of {name} off, and its engine was still running - "
+                 f"it stops once it has finished what it is in the middle of", "warn")
+
+        def then(outcome):
+            if outcome != "none":
+                self.say(f"the sync engine of {name} has stopped", "warn")
+        self._stop_project(repo, quiet=True, then=then)
 
     def _replace_worker(self, repo, start_anyway=False):
         """Worker thread: one engine moved onto this build, one line about it."""
@@ -6169,10 +6419,12 @@ class App(tk.Tk):
         name = os.path.basename(repo.rstrip("\\/")) or repo
         was = ("v" + old) if old else "an older version"
         now = "v" + APP_VERSION
-        if outcome == "restarted" and old == APP_VERSION:
-            # Same version: it was replaced because it worked on the folder's
-            # old place (a folder moved while its engine ran).
+        if outcome == "restarted" and detail == "place":
+            # It worked on the folder's old place (moved while it ran).
             line, tag = f"the sync engine of {name} now works from the folder's new place", "ok"
+        elif outcome == "restarted" and detail == "build":
+            line, tag = (f"restarted the sync engine of {name} on this build of {now} - "
+                         f"it was running an earlier build of it"), "ok"
         elif outcome == "restarted":
             line, tag = (f"restarted the sync engine of {name} on {now} - "
                          f"it was still running {was}"), "ok"
@@ -6207,6 +6459,8 @@ class App(tk.Tk):
         if self.repo and ENGINES.stopping(self.repo):
             return                  # already on its way off; the button says so
         if not self.sync_running():
+            # The person turns it on - which is what lifts an earlier Stop.
+            self._keep_intent(self.repo, True)
             self.start_sync()
             return
 
@@ -6425,11 +6679,15 @@ class App(tk.Tk):
             return
         # The project moved - it did not become a second project. Drop the old
         # entry, or the list keeps a dead row pointing at a folder that is gone.
+        # Whether it syncs did not move: that goes along with it.
+        was = sync_intent(self.cfg, old) if old else None
         if old:
             forget_project(self.cfg, old)
         self.repo = p
         self.cfg["last_project"] = p
         remember_project(self.cfg, p)
+        if was is not None:
+            set_sync_intent(self.cfg, p, was)
         save_config(self.cfg)
         self._show_project()
         self.say(f"project location changed to {p}", "warn")
@@ -6588,9 +6846,12 @@ class App(tk.Tk):
             return
         if not self._is_ours_or_offer_share(p):
             return
+        was = sync_intent(self.cfg, gone) if gone else None     # it goes along
         if gone and os.path.normcase(gone) != os.path.normcase(p):
             forget_project(self.cfg, gone)
         remember_project(self.cfg, p)
+        if was is not None:
+            set_sync_intent(self.cfg, p, was)
         self.repo = p
         self.cfg["last_project"] = p
         save_config(self.cfg)
@@ -6672,7 +6933,8 @@ class App(tk.Tk):
                     APP_NAME,
                     f"{name} is still syncing in the background." + NN +
                     "Yes: stop syncing it too, and remove it from the list." + N +
-                    "No: only remove it from the list - it keeps syncing, out of sight." + N +
+                    "No: only remove it from the list - it keeps syncing, out of sight, "
+                    "until this machine restarts (only listed projects are resumed)." + N +
                     "Cancel: do nothing.")
             else:
                 answer = messagebox.askyesno(
@@ -6930,6 +7192,7 @@ class App(tk.Tk):
         """Only now is the folder a project worth reopening."""
         self._setting_up = False
         remember_project(self.cfg, self.repo)
+        set_sync_intent(self.cfg, self.repo, True)     # shared or joined: it syncs
         self.cfg["last_project"] = self.repo
         save_config(self.cfg)
         self.lines.put("setup finished - starting sync")
@@ -7010,13 +7273,7 @@ class App(tk.Tk):
                 text=f"Conflict in {n} file(s). Nothing was published, nothing was lost.\n"
                      f"Both versions are saved side by side for you.")
             self.pill.set("conflict", BAD)
-            latest = None
-            croot = os.path.join(self.repo, "_conflicts")
-            if os.path.isdir(croot):
-                subs = sorted(d for d in os.listdir(croot) if os.path.isdir(os.path.join(croot, d)))
-                if subs:
-                    latest = os.path.join(croot, subs[-1])
-            self.conflict_dir = latest
+            self.conflict_dir = newest_conflict_export(self.repo)
             return
 
         self.banner.pack_forget()

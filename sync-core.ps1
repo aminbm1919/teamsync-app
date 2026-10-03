@@ -23,6 +23,9 @@ function Initialize-SyncCore {
     # Inside .git, not beside the work: nothing there is ever committed, and
     # the file watcher ignores it - so a request to stop can never travel.
     $script:SC_StopSignal   = Join-Path (Join-Path $Repo '.git') 'teamsync-stop'
+    # Which build of the engine this is (Get-EngineBuild). The daemon sets it;
+    # a script that only borrows these functions names none.
+    if (-not $script:SC_Build) { $script:SC_Build = '' }
     $script:SC_Offline      = $false
     $script:SC_PendingPublish = 0
     Set-GitOutputUtf8
@@ -247,6 +250,26 @@ function Test-DaemonAlive {
     return 0
 }
 
+function Get-EngineBuild {
+    # Which build of the engine this is - its code, not its version label: the
+    # first 12 hex digits of SHA-256 over the engine script and then the
+    # sync-core.ps1 beside it, the bytes as they are on disk. The app computes
+    # the same over the files it ships (engine_fingerprint) and compares, so
+    # two builds of one version are told apart. Found 2026-10-03: an engine of
+    # the first 2.2.1 build ran on under the second for a day and a half,
+    # because both said "2.2.1". '' when the files cannot be read.
+    param([string]$Script)
+    try {
+        $bytes = New-Object System.Collections.Generic.List[byte]
+        $bytes.AddRange([IO.File]::ReadAllBytes($Script))
+        $core = Join-Path (Split-Path -Parent $Script) 'sync-core.ps1'
+        if (Test-Path -LiteralPath $core) { $bytes.AddRange([IO.File]::ReadAllBytes($core)) }
+        $sha = [Security.Cryptography.SHA256]::Create()
+        $hex = -join ($sha.ComputeHash($bytes.ToArray()) | ForEach-Object { $_.ToString('x2') })
+        return $hex.Substring(0, 12)
+    } catch { return '' }
+}
+
 function Receive-StopRequest {
     # Has the app asked this engine to stop? '' if not; 'stop' for the
     # person's Stop sync, Disconnect or a move; 'restart' when the app moves it
@@ -282,6 +305,8 @@ function Update-Heartbeat {
             # Test-DaemonAlive.
             "started=$($script:SC_StartTime)"
             "version=$($script:SC_AppVersion)"
+            # Its code, as a fingerprint: two builds of one version differ here.
+            "build=$($script:SC_Build)"
             # This engine stops itself when asked (Receive-StopRequest), so
             # the app asks instead of choosing a moment to end it from outside.
             "stop=signal"
@@ -1934,14 +1959,36 @@ function Save-Side {
     Set-Content -LiteralPath $Destination -Value $content -Encoding UTF8
 }
 
+# Every export under _conflicts gets a folder of its own, named by the moment
+# it was made - yyyy-MM-dd_HH-mm-ss, then -02, -03 ... when that second already
+# has one - plus a suffix for crossed edits. Named by the second alone, two
+# conflicts reported within one second shared a folder and the second
+# CONFLICT.md overwrote the first: test_conflict_broadcast reports twice about
+# a second apart and failed 1 run in 6 (2026-10-03). And crossed edits were
+# named in another format (yyyyMMdd-HHmmss), which sorted after every conflict
+# export whatever its time. Name order is time order now: the window and
+# push-now find the newest conflict export by it. One engine per worktree, so
+# nothing else creates folders here between the look and the make.
+function New-ExportFolder {
+    param([string]$Suffix = '')
+    $stamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
+    $name  = "$stamp$Suffix"
+    $n = 2
+    while (Test-Path -LiteralPath (Join-Path $script:SC_ConflictRoot $name)) {
+        $name = '{0}-{1:D2}{2}' -f $stamp, $n, $Suffix
+        $n++
+    }
+    New-Item -ItemType Directory -Path (Join-Path $script:SC_ConflictRoot $name) -Force | Out-Null
+    return $name
+}
+
 function Report-Conflict {
     param([string]$Phase)
     $files = Get-Unmerged
     if ($files.Count -eq 0) { return }
 
-    $stamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
+    $stamp = New-ExportFolder
     $dir   = Join-Path $script:SC_ConflictRoot $stamp
-    New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
     $md = New-Object System.Collections.Generic.List[string]
     $md.Add('# Conflict')
@@ -2103,9 +2150,7 @@ function Invoke-Integrate {
     $crossed = @($mine | Where-Object { $incoming -contains $_ })
     $crossDir = ''
     if ($crossed.Count -gt 0) {
-        $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss') + '-crossed'
-        $crossDir = Join-Path $script:SC_ConflictRoot $stamp
-        New-Item -ItemType Directory -Path $crossDir -Force | Out-Null
+        $crossDir = Join-Path $script:SC_ConflictRoot (New-ExportFolder -Suffix '-crossed')
         $mb = git merge-base HEAD "origin/$($script:SC_Branch)" 2>$null
         foreach ($f in $crossed) {
             # The whole path, not the leaf. Two files called notes.md in

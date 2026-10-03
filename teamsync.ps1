@@ -70,6 +70,9 @@ if ($shared -ne $true) {
 # Only now, with the folder known to be ours, does the engine set anything in
 # it (Initialize-SyncCore writes the repository's git config).
 Initialize-SyncCore -Repo $repo -Branch $Branch -NoPopup:$NoPopup -AppVersion $AppVersion
+# Which build this is, from the very files this process just read - the
+# heartbeat carries it, so the app can tell two builds of one version apart.
+$script:SC_Build = Get-EngineBuild -Script $PSCommandPath
 
 # Single instance per folder. The daemon may be running detached in the
 # background (the window was closed); starting a second one would race the

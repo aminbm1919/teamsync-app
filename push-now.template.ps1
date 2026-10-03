@@ -48,8 +48,13 @@ git config core.quotePath false 2>$null | Out-Null
 
 # A conflict outranks everything. Publishing on top of one is never right.
 if (@(git diff --name-only --diff-filter=U 2>$null).Count -gt 0) {
+    # The newest CONFLICT export: named by its moment, -02, -03 for a second
+    # that already had one (New-ExportFolder in sync-core.ps1), so name order
+    # is time order. A crossed-edits keepsake is not one, and neither is a
+    # teammate's report saved from the window (<name>-report) - it sorted
+    # after every export and was offered as the conflict to read.
     $latest = Get-ChildItem (Join-Path $repo '_conflicts') -Directory -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -notlike '*-crossed' } |
+              Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(-\d+)?$' } |
               Sort-Object Name | Select-Object -Last 1
     Say 'A conflict is open. Nothing was published.' 'Red'
     if ($latest) { Say "Read: _conflicts\$($latest.Name)\CONFLICT.md" 'Yellow' }

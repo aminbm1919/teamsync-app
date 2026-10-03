@@ -29,7 +29,8 @@ The buttons
   Publish now      send finished work immediately (AI agents use push-now.ps1)
   Stop sync        pause the engine (closing the window does NOT stop it);
                    it says Stopping... for a few seconds while the engine
-                   finishes what it is in the middle of
+                   finishes what it is in the middle of, and the project
+                   stays off - across restarts too - until Start sync
   Open folder      the project in Explorer
   Change folder    move the project somewhere else, safely, while syncing
   History          older log lines - the live log keeps about a day and
@@ -109,3 +110,10 @@ Updates
   Every project's background engine moves to the new version too, the next
   time the app starts - while it rests between two rounds of work, never in
   the middle of one. A project whose syncing was off stays off.
+
+Restarts
+  Every project that was syncing carries on by itself after the machine
+  restarts - at login when "Start with Windows" is on, otherwise as soon as
+  you open the app. A project you turned off stays off until you turn it on -
+  even when the app was closed or updated in the seconds its engine was still
+  finishing its work: the next start lets that stop finish, never undoes it.
