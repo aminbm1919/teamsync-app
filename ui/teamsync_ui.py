@@ -23,6 +23,7 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -39,7 +40,7 @@ APP_NAME = "TeamSync"
 # and third are single digits, so the line runs 2.1.0 ... 2.1.9, then 2.2.0,
 # on to 2.9.9, and then 3.0.0. publish-release.ps1 refuses anything else, so
 # the rule cannot be broken by forgetting it.
-APP_VERSION = "2.2.0"           # compared against the newest release tag
+APP_VERSION = "2.2.1"           # compared against the newest release tag
 UPDATE_REPO = "aminbm1919/teamsync-app"   # public since 2026-08-28: source and releases
 # The app ships as a folder, not a single file. A one-file build unpacks ~970
 # files into %TEMP% on every launch, and on a machine whose antivirus interferes
@@ -55,6 +56,14 @@ RELEASE_PUBKEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOlpU5x3Y/XUpN6lwFpU4G/CtX
 SIGN_NAMESPACE = "teamsync"
 POWERSHELL = "powershell.exe"
 CREATE_NO_WINDOW = 0x08000000
+# The startup sweep that moves every running engine onto this build (see
+# App._sweep_engines). Only the built app runs it: a source run is a test or a
+# developer, and must not reach into the engines of the installed app.
+SWEEP_ENGINES_AT_START = bool(getattr(sys, "frozen", False))
+REPLACE_WAIT = 120      # seconds an engine gets to come to its rest between passes
+REPLACE_QUIET = 0.3     # no command seen for this long = it is resting, not between two
+REPLACE_POLL = 0.05     # how often to look
+ENGINE_UP_WAIT = 60     # seconds for a restarted engine's first heartbeat
 N = chr(10)
 NN = N + N
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -258,7 +267,763 @@ def kill_pid(pid):
                    capture_output=True, creationflags=CREATE_NO_WINDOW)
 
 
-ONLINE_SECONDS = 150       # the engine beats every 60 s; this allows two misses
+# ------------------------------------------------------------ the engines ---
+
+
+def engine_script():
+    """The engine this copy of the app runs."""
+    return resource_path("engine", "teamsync.ps1")
+
+
+def engine_command(repo):
+    """The one command every engine is started with: this copy's engine,
+    told which build it is - the version its heartbeat then carries."""
+    return [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", engine_script(),
+            "-Path", repo, "-NoPopup", "-AppVersion", APP_VERSION]
+
+
+def launch_engine(repo):
+    """Start repo's engine DETACHED: no pipes to any window, so closing a
+    window can never break or stop it - its story reaches the window through
+    the log file. Returns the Popen; raises if Windows refuses.
+
+    Started from a neutral folder, never from the project. A process holds the
+    folder it was started in against being moved or renamed, and the engine's
+    own Set-Location does not release it: PowerShell moves its location, not
+    the process's. Measured 2026-10-02: started with cwd=<project>, as the
+    window always started it, the engine held the project folder for its
+    whole life ("being used by another process"); started elsewhere, the
+    folder moved freely - with the REAL engine and its file watcher too, which
+    then stopped by itself within two seconds. Same family as the 2.0.7 update
+    helper that held the very folder it had to replace.
+
+    A stop request left from an engine that is gone would stop this one at
+    its first pass: it is cleared first (the engine clears it too).
+    """
+    clear_stop_request(repo)
+    return subprocess.Popen(engine_command(repo), cwd=tempfile.gettempdir(),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+
+
+# The window knows an engine by the heartbeat it writes into its project:
+# pid, start time, version. Finding engines the window was never told about,
+# and stopping one at a safe moment, means looking at the processes
+# themselves. These calls ask Windows directly - not WMI, which is slow, is
+# sometimes broken, and would hand a Persian path back through a code page
+# (Set-GitOutputUtf8 in sync-core.ps1 has what that does).
+
+class _ProcessEntry(ctypes.Structure):
+    _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong),
+                ("th32ProcessID", ctypes.c_ulong), ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", ctypes.c_ulong), ("cntThreads", ctypes.c_ulong),
+                ("th32ParentProcessID", ctypes.c_ulong), ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", ctypes.c_ulong), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+class _UnicodeString(ctypes.Structure):
+    _fields_ = [("Length", ctypes.c_ushort), ("MaximumLength", ctypes.c_ushort),
+                ("Buffer", ctypes.c_void_p)]
+
+
+_WINAPI = {}
+
+
+def _winapi():
+    """kernel32, ntdll and shell32 with their prototypes declared.
+
+    Undeclared, ctypes passes and returns plain ints, which cuts a 64-bit
+    handle in half. Declared on library objects of their own, so the calls
+    the rest of the app makes (pid_alive, process_start) are untouched.
+    """
+    if not _WINAPI:
+        handle = ctypes.c_void_p
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateToolhelp32Snapshot.restype = handle
+        k32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_ulong, ctypes.c_ulong]
+        for fn in (k32.Process32FirstW, k32.Process32NextW):
+            fn.restype = ctypes.c_int
+            fn.argtypes = [handle, ctypes.POINTER(_ProcessEntry)]
+        k32.OpenProcess.restype = handle
+        k32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        k32.CloseHandle.argtypes = [handle]
+        k32.TerminateProcess.restype = ctypes.c_int
+        k32.TerminateProcess.argtypes = [handle, ctypes.c_uint]
+        k32.WaitForSingleObject.restype = ctypes.c_ulong
+        k32.WaitForSingleObject.argtypes = [handle, ctypes.c_ulong]
+        k32.LocalFree.argtypes = [ctypes.c_void_p]
+        nt = ctypes.WinDLL("ntdll")
+        nt.NtQueryInformationProcess.restype = ctypes.c_ulong
+        nt.NtQueryInformationProcess.argtypes = [handle, ctypes.c_ulong, ctypes.c_void_p,
+                                                 ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+        sh = ctypes.WinDLL("shell32")
+        sh.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+        sh.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+        _WINAPI.update(k32=k32, nt=nt, sh=sh)
+    return _WINAPI
+
+
+def process_table():
+    """[(pid, parent pid, program)] for every process now running; [] if
+    Windows will not say."""
+    k32 = _winapi()["k32"]
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)          # TH32CS_SNAPPROCESS
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        return []
+    try:
+        entry = _ProcessEntry()
+        entry.dwSize = ctypes.sizeof(entry)
+        table = []
+        more = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while more:
+            table.append((entry.th32ProcessID, entry.th32ParentProcessID, entry.szExeFile))
+            more = k32.Process32NextW(snap, ctypes.byref(entry))
+        return table
+    finally:
+        k32.CloseHandle(snap)
+
+
+def process_command_line(pid):
+    """The command line a process was started with, or None."""
+    w = _winapi()
+    handle = w["k32"].OpenProcess(0x1000, 0, int(pid))   # QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        size, need = 2048, ctypes.c_ulong(0)
+        for _ in range(4):
+            buf = ctypes.create_string_buffer(size)
+            status = w["nt"].NtQueryInformationProcess(handle, 60, buf, size,  # command line
+                                                       ctypes.byref(need))
+            if status in (0xC0000004, 0xC0000023, 0x80000005):  # too small: grow, ask again
+                size = max(need.value, size * 2)
+                continue
+            if status != 0:
+                return None
+            text = _UnicodeString.from_buffer(buf)
+            return ctypes.wstring_at(text.Buffer, text.Length // 2) if text.Buffer else ""
+        return None
+    finally:
+        w["k32"].CloseHandle(handle)
+
+
+def split_command_line(line):
+    """A command line split exactly as Windows splits it for the program."""
+    w = _winapi()
+    count = ctypes.c_int(0)
+    argv = w["sh"].CommandLineToArgvW(line, ctypes.byref(count))
+    if not argv:
+        return []
+    try:
+        return [argv[i] for i in range(count.value)]
+    finally:
+        w["k32"].LocalFree(ctypes.cast(argv, ctypes.c_void_p))
+
+
+def _same_folder(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):
+        return False
+
+
+def engine_folder(pid):
+    """The folder an engine process was started for (its -Path), or None."""
+    line = process_command_line(pid)
+    if not line:
+        return None
+    args = split_command_line(line)
+    low = [a.lower() for a in args]
+    try:
+        return args[low.index("-path") + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def engine_serves(pid, repo):
+    """Does this engine work on THIS folder? True, False, or None when its
+    command line says nothing either way.
+
+    A heartbeat travels with its folder. Moved while its engine runs - which
+    a folder can be now - the folder carries a heartbeat that vouches for an
+    engine still working on the OLD path, for the second or two before that
+    engine notices and stops. Opening the folder at its new place must not
+    "reconnect" to an engine about to vanish, and a stop request written
+    here would never reach it: its requests are read where it works."""
+    folder = engine_folder(pid)
+    if folder is None:
+        return None
+    return _same_folder(folder, repo)
+
+
+# The engine's stop request (sync-core.ps1, Receive-StopRequest): a file in
+# the project's .git, holding "stop" or "restart". The engine takes it only by
+# deleting it, and the app withdraws it the same way, so whichever delete
+# succeeds decides.
+STOP_REQUEST = "teamsync-stop"
+
+
+def _stop_request_path(repo):
+    return os.path.join(repo, ".git", STOP_REQUEST)
+
+
+def ask_engine_to_stop(repo, mode):
+    """Leave repo's engine a request to stop at its next rest. True if written."""
+    try:
+        with open(_stop_request_path(repo), "w", encoding="ascii") as fh:
+            fh.write(mode)
+        return True
+    except OSError:
+        return False
+
+
+def withdraw_stop_request(repo):
+    """Take a request back. True: it was still there, and the engine will now
+    never act on it. False: nothing to take back - the engine has already
+    taken it, and is on its way out (or there was none)."""
+    for _ in range(10):
+        try:
+            os.remove(_stop_request_path(repo))
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            time.sleep(0.05)        # the engine is reading it this instant
+    return False
+
+
+def clear_stop_request(repo):
+    try:
+        os.remove(_stop_request_path(repo))
+    except OSError:
+        pass
+
+
+def engines_on_machine(script):
+    """{project folder: pid} for every engine on this machine running `script`.
+
+    The app knows the projects it LISTS; an engine knows nothing of the list.
+    Measured 2026-10-02: the engine still running 2.1.9 code - the marker refs
+    that carried unsent commits to GitHub - served a test project that had
+    dropped off the list while its engine ran on. Walking the list alone would
+    never have reached the one engine this exists for.
+
+    Only engines of THIS copy's script. An update swaps the program folder in
+    place, so every engine this installation ever started runs from the same
+    path; another copy of TeamSync - a test, a source run - answers for its own.
+    """
+    want = os.path.normcase(os.path.abspath(script))
+    name = os.path.basename(want)
+    found = {}
+    for pid, _parent, program in process_table():
+        if program.lower() not in ("powershell.exe", "pwsh.exe"):
+            continue
+        line = process_command_line(pid)
+        if not line or name not in line.lower():
+            continue
+        args = split_command_line(line)
+        low = [a.lower() for a in args]
+        try:
+            ran = args[low.index("-file") + 1]
+            folder = args[low.index("-path") + 1]
+        except (ValueError, IndexError):
+            continue
+        if os.path.normcase(os.path.abspath(ran)) == want:
+            found[folder] = pid
+    return found
+
+
+def engine_busy(pid, born):
+    """Is the engine in the middle of a command - git, gh - right now?
+
+    Its child processes say so. The engine itself never touches the
+    repository; git does, in a process of its own, and git is what must not
+    be cut off. Killed, it can leave its lock files behind (index.lock, a
+    ref's .lock); orphaned, it dies at its next write into the engine's pipe,
+    a rebase half done. Either way every later engine then fails on that
+    repository with nobody watching. Measured 2026-10-02 on the two live
+    engines here: a git child was running in 89-96% of 1,086 samples -
+    network pushes and fetches of 6-8 s each - so stopping an engine at a
+    random moment catches one nearly every time. Its console host is not
+    work. `born` is the engine's own start: a process that names it as parent
+    but started earlier belonged to an older holder of the same id.
+    """
+    for child, parent, program in process_table():
+        if parent != pid or program.lower() == "conhost.exe":
+            continue
+        start = process_start(child)
+        if start is not None and born is not None and start < born:
+            continue
+        return True
+    return False
+
+
+def _engine_pid(repo, tries=3):
+    """daemon_pid, asked again before believing "no engine". The engine
+    rewrites its heartbeat every pass - truncate, then write - and a read
+    landing between the two finds an empty file. Once, that is noise; here it
+    would skip a stale engine silently until the next start."""
+    for attempt in range(tries):
+        pid = daemon_pid(repo)
+        if pid or attempt == tries - 1:
+            return pid
+        time.sleep(0.05)
+
+
+def stale_engines(listed):
+    """Every project folder whose LIVE engine runs code other than this build's.
+
+    Looked for in two places: the projects the app lists, and every engine on
+    the machine running this copy's engine script (an engine outlives the list
+    - see engines_on_machine). A folder with no engine running is never in the
+    answer: a replacement stops one engine and starts one; it never starts one
+    where none ran.
+    """
+    folders = {}
+    for path in listed:
+        if path:
+            folders.setdefault(_engine_key(path), path)
+    try:
+        for path in engines_on_machine(engine_script()):
+            folders.setdefault(_engine_key(path), path)
+    except Exception:
+        pass            # the processes could not be read: the list still counts
+    stale = []
+    for path in folders.values():
+        pid = _engine_pid(path) if os.path.isdir(path) else None
+        if pid is None:
+            continue
+        if (daemon_state(path).get("version", "") != APP_VERSION
+                or engine_serves(pid, path) is False):
+            stale.append(path)
+    return stale
+
+
+def unlisted_engines(cfg):
+    """Folders with an engine of this copy running that are NOT on the app's
+    list - removed from it earlier, say, while the engine ran on. Invisible
+    until now: a test project synced like that for a day."""
+    listed = {_engine_key(e.get("path", "")) for e in cfg.get("projects", [])
+              if e.get("path")}
+    found = []
+    try:
+        for folder in engines_on_machine(engine_script()):
+            if (os.path.isdir(folder) and _engine_key(folder) not in listed
+                    and daemon_pid(folder) is not None):
+                found.append(folder)
+    except Exception:
+        pass
+    return sorted(found, key=lambda f: os.path.basename(f.rstrip("\\/")).lower())
+
+
+def _engine_key(repo):
+    """One key per FOLDER, however it is spelled. A folder reached two ways
+    (a junction, a second spelling on the list) is still one worktree, and
+    two replacements racing on it would start two engines there."""
+    try:
+        st = os.stat(repo)
+        if st.st_ino:
+            return ("id", st.st_dev, st.st_ino)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.normpath(os.path.abspath(repo)))
+
+
+class Engines:
+    """Every engine this app starts, stops or replaces - one record per project.
+
+    The window used to keep ONE engine: the last it had started, whichever
+    project that was. Measured 2026-10-02: open A (its engine started here),
+    go Home, open B (its engine adopted, already running), press Stop sync -
+    and A's engine was killed as well, with nothing on screen to say so. An
+    engine belongs to a project, so they are kept by project.
+
+    It also keeps what is under way - a replacement onto this build, or the
+    person's stop - so the startup sweep, a window opening that project, and
+    Stop never act on one folder at once: two engines started on one worktree
+    is the one thing git cannot survive, and a replacement that brings an
+    engine back after the person said stop is worse than the stale one.
+
+    Every way an engine ends goes through one routine, _end_one: at rest,
+    never in the middle of a git command. An engine that understands a stop
+    request (2.2.1 on) is asked, and stops itself at the top of its next
+    pass. An older one - or one working on another folder, whose requests are
+    read there - is watched from outside and ended in its rest.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._changed = threading.Condition(self._lock)
+        self._procs = {}        # project -> (the Popen this app started, its folder)
+        self._jobs = {}         # project -> a replacement under way
+        self._stops = {}        # project -> the person's stop under way
+        self._closing = False
+
+    # -- what is running -------------------------------------------------
+
+    def ours(self, repo):
+        """The engine this app started for repo, while it runs; else None.
+        One started for another folder - this project's old place - is not."""
+        with self._lock:
+            entry = self._procs.get(_engine_key(repo))
+        if entry is None:
+            return None
+        proc, folder = entry
+        if proc.poll() is not None or not _same_folder(folder, repo):
+            return None
+        return proc
+
+    def replacing(self, repo):
+        with self._lock:
+            return _engine_key(repo) in self._jobs
+
+    def stopping(self, repo):
+        with self._lock:
+            return _engine_key(repo) in self._stops
+
+    def running(self, repo):
+        """Is an engine covering repo - one started here, one adopted by its
+        heartbeat, or one being swapped or stopped right now?"""
+        if not repo:
+            return False
+        return (self.replacing(repo) or self.stopping(repo)
+                or self.ours(repo) is not None or daemon_pid(repo) is not None)
+
+    # -- starting ----------------------------------------------------------
+
+    def start(self, repo):
+        """Start repo's engine now - it was opened, and none runs there."""
+        with self._lock:
+            proc = launch_engine(repo)
+            self._procs[_engine_key(repo)] = (proc, repo)
+        return proc
+
+    def claim(self, repo):
+        """Reserve repo for one replacement. False when one is already under
+        way there, the person is stopping it, or the app is closing."""
+        key = _engine_key(repo)
+        with self._lock:
+            if self._closing or key in self._jobs or key in self._stops:
+                return False
+            self._jobs[key] = {"cancel": False, "swapping": False, "mode": None}
+            return True
+
+    # -- the person's stop -------------------------------------------------
+
+    def stop(self, repo, done=None, wait=None):
+        """The person's Stop sync, Disconnect or Change folder, or a project
+        taken off the list together with its syncing. Returns at once - False
+        when nothing runs there. The engine then ends at rest, on a worker
+        thread, and `done(outcome)` is called there: 'stopped', or 'killed'
+        when it never came to rest within `wait` seconds and was ended where
+        it stood, the way every Stop did before. A replacement under way is
+        called off first, so it cannot bring an engine back behind the
+        person's back."""
+        key = _engine_key(repo)
+        if not (self.replacing(repo) or self.ours(repo) is not None
+                or _engine_pid(repo) is not None):
+            return False
+        with self._lock:
+            stop = self._stops.get(key)
+            if stop is not None:                 # already on its way
+                if done is not None:
+                    stop["done"].append(done)
+                return True
+            job = self._jobs.get(key)
+            if job is not None:
+                job["cancel"] = True
+            stop = {"repo": repo, "mode": None, "done": [done] if done else []}
+            self._stops[key] = stop
+        threading.Thread(target=self._stop_job, daemon=True,
+                         args=(repo, key, stop, REPLACE_WAIT if wait is None else wait)).start()
+        return True
+
+    def _stop_job(self, repo, key, stop, wait):
+        outcome = "none"
+        try:
+            # A replacement just called off may be in its one step; it ends
+            # first, so the two never act on the folder at once.
+            with self._lock:
+                give_up = time.time() + 30
+                while key in self._jobs and time.time() < give_up:
+                    self._changed.wait(0.25)
+            targets = []
+            proc = self.ours(repo)
+            if proc is not None:
+                targets.append(proc.pid)
+            pid = _engine_pid(repo)
+            if pid and pid not in targets:
+                targets.append(pid)
+            killed = False
+            for pid in targets:
+                if self._end_one(repo, pid, wait, stop, "stop") in ("busy", "failed"):
+                    kill_pid(pid)           # the last resort: what every Stop did before
+                    killed = True
+            if targets:
+                outcome = "killed" if killed else "stopped"
+                with self._lock:
+                    entry = self._procs.get(key)
+                    if entry is not None and entry[0].poll() is not None:
+                        self._procs.pop(key, None)
+                # Ended from outside, an engine cannot remove its heartbeat.
+                if daemon_pid(repo) is None:
+                    try:
+                        os.remove(os.path.join(repo, ".teamsync.lock"))
+                    except OSError:
+                        pass
+        finally:
+            with self._lock:
+                self._stops.pop(key, None)
+                callbacks = list(stop["done"])
+                self._changed.notify_all()
+            for fn in callbacks:
+                try:
+                    fn(outcome)
+                except Exception:
+                    pass
+
+    def stop_now(self, repo):
+        """End every engine on repo at once, wherever it stands - the old way,
+        kept for the last resort and for tidying up after tests."""
+        key = _engine_key(repo)
+        with self._lock:
+            job = self._jobs.get(key)
+            if job is not None:
+                job["cancel"] = True
+            entry = self._procs.pop(key, None)
+        if entry is not None and entry[0].poll() is None:
+            kill_pid(entry[0].pid)
+        pid = daemon_pid(repo)
+        if pid:
+            kill_pid(pid)
+
+    # -- the app coming and going -----------------------------------------
+
+    def opened(self):
+        with self._lock:
+            self._closing = False
+
+    def close(self, wait=10.0):
+        """The app is going away. A replacement still waiting for its moment
+        lets go - that engine runs on, on its old code, until the next start
+        moves it - while one whose old engine is already ending is waited for
+        until the new one is started: an engine is never stopped and then
+        forgotten, which would end that project's syncing silently. The
+        person's stop rides on the engine's own request where it has one, and
+        the request outlives the app; where it has none, the stop is finished
+        now, the old way."""
+        with self._lock:
+            self._closing = True
+            unfinished = [s["repo"] for s in self._stops.values() if s["mode"] != "request"]
+        for repo in unfinished:
+            self.stop_now(repo)
+        with self._lock:
+            give_up = time.time() + wait
+            while any(job["swapping"] for job in self._jobs.values()):
+                left = give_up - time.time()
+                if left <= 0:
+                    break
+                self._changed.wait(left)
+
+    # -- moving an engine onto this build -----------------------------------
+
+    def replace(self, repo, wait=None, up=None, start_anyway=False):
+        """Move repo's live engine onto this build. Blocking - for a worker
+        thread, after claim(). `start_anyway`: the person opened the project,
+        so if its engine has gone by itself meanwhile, one is started all the
+        same. Returns (outcome, old version, detail):
+
+          restarted - the old engine is gone, and the new one's own heartbeat
+                      says this version
+          started   - (start_anyway) the old one had gone by itself; a new one
+                      was started, and says this version
+          busy      - it never came to rest within `wait` seconds, so it was
+                      left running as it was
+          lost      - the old engine was stopped but the new one could not be
+                      started: nothing syncs that project now
+          died      - the new one stopped at once; slow - it has not reported
+          failed    - the old one could not be stopped; it runs on as it was
+          none, current, gone, cancelled - nothing to do, nothing done
+        """
+        key = _engine_key(repo)
+        try:
+            return self._replace(repo, key, REPLACE_WAIT if wait is None else wait,
+                                 ENGINE_UP_WAIT if up is None else up, start_anyway)
+        finally:
+            with self._lock:
+                job = self._jobs.pop(key, None)
+                if job is not None:
+                    job["swapping"] = False
+                self._changed.notify_all()
+
+    def _replace(self, repo, key, wait, up, start_anyway):
+        with self._lock:
+            job = self._jobs.get(key)
+        if job is None:
+            return "cancelled", "", ""
+        pid = _engine_pid(repo)
+        old = daemon_state(repo).get("version", "") if pid else ""
+        ended = None
+        if pid:
+            if old == APP_VERSION and engine_serves(pid, repo) is not False:
+                return "current", old, ""
+            if not os.path.isfile(engine_script()):
+                return "failed", old, "this copy's engine file is missing"
+            ended = self._end_one(repo, pid, wait, job, "restart")
+            if ended in ("cancelled", "busy"):
+                return ended, old, ""
+            if ended == "failed":
+                return "failed", old, "Windows would not stop it"
+            if ended == "gone" and not start_anyway:
+                return "gone", old, ""          # it stopped by itself: start nothing
+        elif not start_anyway:
+            return "none", "", ""
+        # The old engine is gone. One ended from outside could not tidy up:
+        # its heartbeat names a process that no longer exists - removed, as
+        # start_sync always has.
+        try:
+            os.remove(os.path.join(repo, ".teamsync.lock"))
+        except OSError:
+            pass
+        with self._lock:
+            try:
+                if job["cancel"] or (self._closing and not job["swapping"]):
+                    # Stop was pressed while it was being swapped - the person
+                    # gets what they asked for, no engine at all - or the app
+                    # is going and nothing was stopped here.
+                    return "cancelled", old, ""
+                try:
+                    proc = launch_engine(repo)
+                except Exception as exc:
+                    return "lost", old, f"Windows refused to start the new one ({exc})"
+                self._procs[key] = (proc, repo)
+            finally:
+                job["swapping"] = False
+                self._changed.notify_all()
+        done = "restarted" if ended == "ended" else "started"
+        # "Replaced" means the new engine says so itself, in its own heartbeat.
+        give_up = time.time() + up
+        while time.time() < give_up:
+            with self._lock:
+                if job["cancel"]:
+                    return "cancelled", old, ""
+            if proc.poll() is not None:
+                return "died", old, f"exit code {proc.returncode}"
+            if (daemon_pid(repo) == proc.pid
+                    and daemon_state(repo).get("version", "") == APP_VERSION):
+                return done, old, ""
+            time.sleep(0.25)
+        return "slow", old, ""
+
+    # -- ending one engine, at rest ------------------------------------------
+
+    def _end_one(self, repo, pid, wait, job, mode):
+        """End one engine - never in the middle of a git command. `mode` is
+        'restart' (a replacement) or 'stop' (the person's). Returns 'ended',
+        'gone' (it went by itself), 'cancelled', 'busy' (it never came to rest
+        within `wait` seconds and runs on) or 'failed'."""
+        k32 = _winapi()["k32"]
+        # TERMINATE | SYNCHRONIZE | QUERY_LIMITED_INFORMATION
+        handle = k32.OpenProcess(0x0001 | 0x00100000 | 0x1000, 0, int(pid))
+        if not handle:
+            return "gone"
+        try:
+            # A handle held pins the id: Windows gives it to no new process
+            # until the handle is closed. So if this pid is, right now, the
+            # engine the heartbeat vouches for or one this app started, the
+            # handle is that engine and nothing else.
+            ours = self.ours(repo)
+            if _engine_pid(repo) != pid and (ours is None or ours.pid != pid):
+                return "gone"
+            if (engine_serves(pid, repo) is True and _engine_pid(repo) == pid
+                    and daemon_state(repo).get("stop") == "signal"):
+                result = self._end_by_request(repo, handle, wait, job, mode)
+                if result is not None:
+                    return result
+            return self._end_at_rest(pid, handle, wait, job, mode)
+        finally:
+            k32.CloseHandle(handle)
+
+    def _end_by_request(self, repo, handle, wait, job, mode):
+        """Ask the engine to stop itself at the top of its next pass, where it
+        is between two commands by construction. None when the request could
+        not even be written: the caller watches from outside instead."""
+        k32 = _winapi()["k32"]
+        with self._lock:
+            if job.get("cancel") or (self._closing and mode == "restart"):
+                return "cancelled"
+            if not ask_engine_to_stop(repo, mode):
+                return None
+            job["mode"] = "request"
+            if mode == "restart":
+                job["swapping"] = True      # it may go any moment now: close() waits
+        give_up = time.time() + wait
+        while True:
+            if k32.WaitForSingleObject(handle, 100) == 0:
+                return "ended"
+            with self._lock:
+                quit = job.get("cancel") or (self._closing and mode == "restart")
+            if not quit and time.time() < give_up:
+                continue
+            if withdraw_stop_request(repo):
+                # Taken back before the engine read it: it runs on as it was.
+                if mode == "restart":
+                    with self._lock:
+                        job["swapping"] = False
+                        self._changed.notify_all()
+                return "cancelled" if quit else "busy"
+            # The engine has taken it and is on its way out: let it finish.
+            k32.WaitForSingleObject(handle, 60000)
+            return "ended" if k32.WaitForSingleObject(handle, 0) == 0 else "busy"
+
+    def _end_at_rest(self, pid, handle, wait, job, mode):
+        """For an engine that cannot be asked: watched from outside, and ended
+        in its rest between two passes."""
+        k32 = _winapi()["k32"]
+        born = process_start(pid)
+        give_up = time.time() + wait
+        quiet_since = None
+        with self._lock:
+            job["mode"] = "rest"
+        while True:
+            with self._lock:
+                if job.get("cancel") or self._closing:
+                    return "cancelled"
+            if k32.WaitForSingleObject(handle, 0) == 0:
+                return "gone"
+            now = time.time()
+            # Stopped only at REST, not merely between two commands. The
+            # gaps between the git commands of one pass last milliseconds,
+            # and the next command could start in the instant between a look
+            # and the stop; the engine's rest between passes lasts a full
+            # second (teamsync.ps1: Start-Sleep -Seconds 1), and the first
+            # commands after it only read (git rev-parse, git diff
+            # --name-only). No command seen for REPLACE_QUIET means rest, with
+            # most of the second still to run. And the engine alone is
+            # stopped, never a git it started.
+            if engine_busy(pid, born):
+                quiet_since = None
+            elif quiet_since is None:
+                quiet_since = now
+            elif now - quiet_since >= REPLACE_QUIET:
+                with self._lock:
+                    if job.get("cancel") or self._closing:
+                        return "cancelled"
+                    if not k32.TerminateProcess(handle, 1):
+                        return "failed"
+                    if mode == "restart":
+                        job["swapping"] = True
+                k32.WaitForSingleObject(handle, 10000)
+                return "ended"
+            if now >= give_up:
+                return "busy"
+            time.sleep(REPLACE_POLL)
+
+
+ENGINES = Engines()
+
+
+ONLINE_SECONDS = 150      # the engine beats every 60 s; this allows two misses
 
 
 def _is_me(name, mine):
@@ -497,13 +1262,275 @@ def destructive_signature(changes):
     return hashlib.sha1(text.encode("utf-8")).hexdigest().upper()[:12]
 
 
+FILE_LIMIT = 25 * 1024 * 1024    # one file this big, going out for the first time, asks
+GROUP_LIMIT = 50 * 1024 * 1024   # so does a new item that adds this much in all
+_TEAM_TREE = {}                  # repo -> (shared branch's version, what the team has there)
+
+
+def _team_tree(repo, rev):
+    """What the team has at rev: its folders, each file's content id, and the
+    size of each content id. Read once per version of the shared branch - it
+    changes only when somebody publishes. Mirrors Get-DGTeamTree."""
+    cached = _TEAM_TREE.get(repo)
+    if cached and cached[0] == rev:
+        return cached[1]
+    dirs, files, sizes = set(), {}, {}
+    if rev:
+        for t in _split_z(_guard_git(repo, f"ls-tree {rev}", "ls-tree", "-r", "-t", "-l", "-z", rev)):
+            # "<mode> <type> <id> <size>\t<path>"
+            meta, tab, path = t.partition("\t")
+            if not tab:
+                continue
+            f = meta.split()
+            if f[1] == "tree":
+                dirs.add(path)
+            elif f[1] == "blob":
+                files[path] = f[2]
+                sizes[f[2]] = int(f[3])
+    tree = {"dirs": dirs, "files": files, "sizes": sizes}
+    _TEAM_TREE[repo] = (rev, tree)
+    return tree
+
+
+def _guard_committed(repo, tip, upstream):
+    """Every file version inside commits reachable from tip that the team does
+    not have - what a push of tip carries besides the disk. Each content id
+    once, under the first name git reports for it. Mirrors Get-DGCommitted."""
+    rng = [tip, "--not", upstream] if upstream else [tip]
+    raw = _guard_git(repo, "rev-list --objects", "rev-list", "--objects", *rng, "--")
+    named = []
+    for line in raw.decode("utf-8", "replace").split("\n"):
+        # "<id> <path>"; a commit has no path, the top folder an empty one
+        line = line.rstrip("\r")
+        sp = line.find(" ")
+        if 0 < sp < len(line) - 1:
+            named.append((line[:sp], line[sp + 1:]))
+    if not named:
+        return []
+    try:
+        out = subprocess.run(
+            ["git", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+            cwd=repo, input=("\n".join(sha for sha, _ in named) + "\n").encode("ascii"),
+            capture_output=True, creationflags=CREATE_NO_WINDOW, env=_GIT_ENV)
+    except Exception:
+        out = None
+    info = out.stdout.decode("ascii", "replace").splitlines() if out else []
+    if out is None or out.returncode != 0 or len(info) != len(named):
+        raise GuardError("git could not answer the destructive check (cat-file sizes)")
+    pieces = []
+    for (_, path), line in zip(named, info):
+        f = line.split(" ")
+        if len(f) >= 3 and f[1] == "blob":
+            pieces.append({"path": path, "blob": f[0], "size": int(f[2]), "committed": True})
+    return pieces
+
+
+def large_outgoing(repo, tip="HEAD", committed_only=False):
+    """Large content about to leave: [{item, bytes, files, shared, committed}],
+    ordinal by item.
+
+    The window's copy of the large-content rule in the guard block of
+    sync-core.ps1 (read its comment there): what the upload really carries -
+    files on the disk, AND file versions inside commits made here and not yet
+    sent - minus content the team already has, filed under the outermost
+    folder the team does not have, or else the file itself. Held when one file
+    in an item is 25 MB or more, or the item adds 50 MB or more.
+    test_large_guard holds the copies to one answer. Raises GuardError when
+    git cannot answer.
+    """
+    tip_id = git(repo, "rev-parse", "-q", "--verify", tip + "^{commit}")
+    up_id = git(repo, "rev-parse", "-q", "--verify", "refs/remotes/origin/main^{commit}")
+    pieces = _guard_committed(repo, tip_id, up_id) if tip_id else []
+    if not committed_only:
+        disk = set(_split_z(_guard_git(repo, "ls-files --others", "ls-files", "-z", "--others",
+                                       "--exclude-standard")))
+        if tip_id:
+            for letter in ("A", "M"):
+                disk.update(_guard_changed(repo, "HEAD", letter))
+        else:
+            # nothing committed yet: everything staged goes in the first commit
+            disk.update(_split_z(_guard_git(repo, "ls-files", "ls-files", "-z")))
+        for p in disk:
+            full = os.path.join(repo, p.replace("/", os.sep))
+            try:
+                if os.path.isfile(full):
+                    pieces.append({"path": p, "blob": None, "size": os.path.getsize(full),
+                                   "committed": False})
+            except (OSError, ValueError):
+                continue
+    if not pieces:
+        return []
+
+    team = _team_tree(repo, up_id)
+    items, under = {}, {}
+    for pc in pieces:
+        path = pc["path"]
+        shared = path in team["files"]
+        item = path
+        cut = path.rfind("/")
+        if not shared and cut > 0:
+            # the outermost folder the team does not have - once per folder
+            folder = path[:cut]
+            if folder not in under:
+                owner, acc = "", ""
+                for part in folder.split("/"):
+                    acc = acc + "/" + part if acc else part
+                    if acc not in team["dirs"]:
+                        owner = acc + "/"
+                        break
+                under[folder] = owner
+            if under[folder]:
+                item = under[folder]
+        items.setdefault(item, {"item": item, "shared": shared, "pieces": []})["pieces"].append(pc)
+
+    def measure(it):
+        total = biggest = 0
+        paths, committed = set(), False
+        for pc in it["pieces"]:
+            if pc.get("known"):
+                continue
+            total += pc["size"]
+            biggest = max(biggest, pc["size"])
+            paths.add(pc["path"])
+            committed = committed or pc["committed"]
+        return total, (biggest >= FILE_LIMIT or total >= GROUP_LIMIT), len(paths), committed
+
+    candidates = [it for it in items.values() if measure(it)[1]]
+    if not candidates:
+        return []
+
+    # Already there, or already on its way. A file is read (hashed) only when
+    # that could change the answer: its size matches something known, AND
+    # without it the item would no longer be large.
+    known_ids = set(team["sizes"])
+    known_sizes = set(team["sizes"].values())
+    for pc in pieces:
+        if pc["committed"]:
+            known_ids.add(pc["blob"])
+            known_sizes.add(pc["size"])
+    to_hash = []
+    for it in candidates:
+        rest = rest_big = 0
+        maybe = []
+        for pc in it["pieces"]:
+            if pc["committed"]:
+                if pc["blob"] in team["sizes"]:
+                    pc["known"] = True
+                    continue
+            elif pc["size"] in known_sizes:
+                maybe.append(pc["path"])
+                continue
+            rest += pc["size"]
+            rest_big = max(rest_big, pc["size"])
+        if maybe and rest_big < FILE_LIMIT and rest < GROUP_LIMIT:
+            to_hash.extend(maybe)
+    if to_hash:
+        now = _guard_working_blobs(repo, to_hash)
+        for it in candidates:
+            for pc in it["pieces"]:
+                if not pc["committed"] and now.get(pc["path"]) in known_ids:
+                    pc["known"] = True
+
+    held = []
+    for it in candidates:
+        total, big, files, committed = measure(it)
+        if big:
+            held.append({"item": it["item"], "bytes": total, "files": files,
+                         "shared": it["shared"], "committed": committed})
+    return sorted(held, key=lambda h: _ordinal(h["item"]))
+
+
+def large_signature(large):
+    """One particular set of large items, so "send them" covers only those."""
+    import hashlib
+    items = sorted((h["item"] for h in large or []), key=_ordinal)
+    if not items:
+        return ""
+    return hashlib.sha1("\n".join(items).encode("utf-8")).hexdigest().upper()[:12]
+
+
+def approve_large(repo, large):
+    git(repo, "config", "--local", "teamsync.largeok", large_signature(large))
+
+
+def gitignore_line(path):
+    """One exact path as a .gitignore line: anchored to the project root, so it
+    names this item and never a same-named one elsewhere, with git's pattern
+    characters escaped so "[draft].md" means itself. Mirrors
+    Format-GitIgnoreLine in sync-core.ps1."""
+    escaped = re.sub(r"([\[\]*?\\])", r"\\\1", path)
+    if escaped.startswith(("#", "!")):
+        escaped = "\\" + escaped
+    return "/" + escaped
+
+
+def add_gitignore_lines(root, lines):
+    """APPEND the lines .gitignore lacks - its own lines, blank lines and
+    comments are its owners' and are never rewritten - in the line ending the
+    file already uses. Mirrors Add-GitIgnoreLines in sync-core.ps1."""
+    path = os.path.join(root, ".gitignore")
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            text = fh.read()
+    except OSError:
+        text = ""
+    have = set(re.split(r"\r?\n", text))
+    nl = "\r\n" if ("\r\n" in text or not text) else "\n"
+    add = []
+    for line in lines:
+        if line and line not in have and line not in add:
+            add.append(line)
+    if not add:
+        return
+    if text and not text.endswith("\n"):
+        text += nl
+    text += nl.join(add) + nl
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+
+
+def keep_large_home(repo, large):
+    """"Keep them home": into .gitignore, so they are never sent - and the
+    .gitignore travels, so no other machine sends its own copy either.
+
+    Only NEW items: keeping home a file the team already has would take it out
+    of the project for everybody. Something already inside a commit made here
+    would still travel - a push sends commits, not the folder's final state -
+    so the unsent commits are folded back into the next one first; every file
+    stays exactly as it is on the disk. Mirrors Keep-LargeHome in sync-core.ps1.
+    Raises GuardError when that cannot be done safely.
+    """
+    new = [h for h in large if not h.get("shared")]
+    if any(h.get("committed") for h in new):
+        gd = git(repo, "rev-parse", "--git-dir")
+        gd = gd if os.path.isabs(gd) else os.path.join(repo, gd)
+        if not gd or any(os.path.exists(os.path.join(gd, n))
+                         for n in ("rebase-merge", "rebase-apply", "MERGE_HEAD")):
+            raise GuardError("a merge is still being finished here - try again once it is done")
+        base = git(repo, "merge-base", "HEAD", "refs/remotes/origin/main")
+        if not base:
+            raise GuardError("it is already in this folder's own history, which goes up as it is")
+        done = subprocess.run(["git", "reset", "-q", "--soft", base], cwd=repo,
+                              capture_output=True, creationflags=CREATE_NO_WINDOW)
+        if done.returncode != 0:
+            raise GuardError("git could not set the unsent commits aside")
+    add_gitignore_lines(repo, [gitignore_line(h["item"]) for h in new])
+    for h in new:
+        git(repo, "--literal-pathspecs", "rm", "-r", "-q", "--cached", "--ignore-unmatch",
+            "--", h["item"].rstrip("/"))
+    git(repo, "config", "--local", "--unset", "teamsync.largeok")
+
+
 def read_destructive(repo):
-    """(what would be destroyed, the signature already confirmed) - git only,
-    no widgets, so it is safe on a worker thread. Raises GuardError when git
-    cannot answer."""
+    """Everything waiting for the person's word - (what would be destroyed,
+    its confirmed signature, large new content, its confirmed signature) -
+    git only, no widgets, so it is safe on a worker thread. Raises GuardError
+    when git cannot answer."""
     changes = destructive_changes(repo)
     approved = git(repo, "config", "--local", "--get", "teamsync.destructiveok")
-    return changes, approved
+    large = large_outgoing(repo)
+    large_ok = git(repo, "config", "--local", "--get", "teamsync.largeok")
+    return changes, approved, large, large_ok
 
 
 def approve_destructive(repo, changes):
@@ -888,7 +1915,13 @@ def set_volunteer(repo, owner, path, me, volunteering):
     Returns True when GitHub took it.
     """
     ref = f"refs/teamsync/volunteer/{owner}/{_ref_hex(path)}/{me}"
-    args = (["push", "-q", "origin", f"HEAD:{ref}"] if volunteering
+    # Pointed at the shared branch's tip, never at HEAD: only the name
+    # carries the claim, and HEAD can hold commits not yet sent - pushing it
+    # uploaded them past the publish guards (Get-MarkerSource in sync-core).
+    src = "refs/remotes/origin/main"
+    if volunteering and not git(repo, "rev-parse", "-q", "--verify", src):
+        return False
+    args = (["push", "-q", "origin", f"{src}:{ref}"] if volunteering
             else ["push", "-q", "origin", f":{ref}"])
     out = subprocess.run(["git"] + args, cwd=repo, capture_output=True,
                          creationflags=CREATE_NO_WINDOW)
@@ -1305,6 +2338,64 @@ def find_shared_history(path):
         if teamsync_refs_on(slug):
             return slug
     return ""
+
+
+# Every shared project carries these; init-owner refuses to leave them home.
+SHARE_RESERVED = (".gitignore", ".gitattributes", "AGENTS.md", "CLAUDE.md",
+                  "TEAM-PROJECT-REFERENCE.md", "push-now.ps1", "who.ps1", "working.ps1")
+
+
+def exclude_arg(keep):
+    """The -Exclude value for init-owner. Each path is written "./path", so a
+    name that starts with "-" can never be read by PowerShell as a parameter
+    of its own; init-owner takes the "./" off again."""
+    return "|".join("./" + k for k in keep)
+
+
+def share_preview(path, keep):
+    """What sharing `path` WOULD upload, measured by init-owner itself, which
+    touches nothing in the folder (-Preview). The same code then makes the
+    real decision, so what the window shows is what the setup does.
+
+    Returns {"items": [(top-level item, bytes, files)], "machine": [(path,
+    bytes, files)] left out by default, "history": (bytes, commits) or None,
+    "large": [{item, bytes, files, committed}], "error": text or None}.
+    """
+    out = {"items": [], "machine": [], "history": None, "large": [], "error": None}
+    cmd = [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+           resource_path("engine", "init-owner.ps1"), "-Path", path, "-Preview"]
+    if keep:
+        cmd += ["-Exclude", exclude_arg(keep)]
+    try:
+        p = subprocess.run(cmd, capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=600)
+        text = (p.stdout or b"").decode("utf-8", "replace")
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+    done = False
+    for line in text.splitlines():
+        f = line.rstrip("\r").split("\t")
+        try:
+            if f[0] == "TS-ITEM":
+                out["items"].append((f[1], int(f[2]), int(f[3])))
+            elif f[0] == "TS-MACHINE":
+                out["machine"].append((f[1], int(f[2]), int(f[3])))
+            elif f[0] == "TS-HISTORY":
+                out["history"] = (int(f[1]), int(f[2]))
+            elif f[0] == "TS-LARGE":
+                out["large"].append({"item": f[1], "bytes": int(f[2]), "files": int(f[3]),
+                                     "committed": f[4] == "1"})
+            elif f[0] == "TS-ERROR":
+                out["error"] = f[1] if len(f) > 1 else "the measurement failed"
+            elif f[0] == "TS-END":
+                done = True
+        except (IndexError, ValueError):
+            continue
+    if not done and not out["error"]:
+        # Not a finished answer - never read as "nothing to worry about".
+        out["error"] = text.strip()[-600:] or "the measurement gave no answer"
+    out["items"].sort(key=lambda t: _ordinal(t[0]))
+    return out
 
 
 def share_route(path):
@@ -2028,7 +3119,10 @@ HELP = {
         "It looks at everything not yet sent - work on the disk, and work already committed on this machine - and at every earlier version of a file, however old.\n\n"
         "Two answers. \"Publish these\" sends them, and they really do disappear for everyone. \"Put them back\" restores each file from the right place - the newest version on this machine, or the team's version if the damage was already committed here. Nothing was ever lost; every version is here.\n\n"
         "The confirmation covers exactly the files listed. Delete something else afterwards and you are asked again, because you have not seen that one yet.\n\n"
-        "A machine that is simply behind is never caught by this: it is measured from the point where this machine and the team last agreed, so a file it has not received yet is not a file it deleted. Signing in from a second computer is safe."
+        "A machine that is simply behind is never caught by this: it is measured from the point where this machine and the team last agreed, so a file it has not received yet is not a file it deleted. Signing in from a second computer is safe.\n\n"
+        "LARGE content waits here too: one file of 25 MB or more, or one new folder adding 50 MB or more. Once uploaded it stays in the project's history for good - deleting it later takes it out of the folder, never out of the history. A new folder counts as one item however many small files it holds, so a freshly installed node_modules is one line, not ten thousand.\n\n"
+        "\"Keep them home\" puts the item in .gitignore - which travels, so nobody else sends their copy either - and if part of it was already inside a commit made here and not sent, takes it back out of that commit. Every file stays on your disk exactly as it is. \"Send them\" uploads it: right for real work that is simply big. A file the team already has can only be sent - keeping it home would take it away from everybody.\n\n"
+        "Either answer covers that one publish. The same folder grown again next month is asked about again."
     ),
     'requests': (
         "Requests received.\n\n"
@@ -2040,6 +3134,8 @@ HELP = {
     'open_existing': (
         "Open a project already on this machine.\n\n"
         "For later days, or for moving between several shared projects. Pick the project folder itself - the one containing .git - not the folder above it.\n\n"
+        "A project that is still syncing but is not on the list - removed from it earlier, say - is shown too, marked \"syncing - not on your list\", so you can open it again or stop it.\n\n"
+        "Removing a project that is still syncing asks whether its syncing should stop too.\n\n"
         "You rarely need this: the app reopens your last project on its own."
     ),
     'publish': (
@@ -2051,6 +3147,7 @@ HELP = {
     'syncbtn': (
         "Turn syncing on or off.\n\n"
         "Off means nothing is sent and nothing is received until you turn it on again. Your work stays safe in local commits either way.\n\n"
+        "Turning it off takes a few seconds, and the button says Stopping... meanwhile: the engine first finishes what it is in the middle of. A git command cut off halfway can leave the project stuck for the next engine.\n\n"
         "Closing the window does NOT turn syncing off - the engine keeps running in the background. This button and Disconnect are the only off switches."
     ),
     'openfolder': (
@@ -2059,7 +3156,7 @@ HELP = {
     'relocate': (
         "Change folder.\n\n"
         "If you moved or renamed the project folder, point the app at its new location from here.\n\n"
-        "No need to close the window or go Home first. Syncing stops at the old path and starts at the new one. Nothing is lost."
+        "No need to close the window or go Home first. Syncing stops at the old path - once its engine has finished what it is in the middle of - and then starts at the new one. Nothing is lost."
     ),
     'home': (
         "Home.\n\n"
@@ -2067,7 +3164,7 @@ HELP = {
     ),
     'disconnect': (
         "Disconnect this project.\n\n"
-        "Stops its sync engine completely - nothing left running in the background - and removes the project from the app's list.\n\n"
+        "Stops its sync engine completely - nothing left running in the background - and removes the project from the app's list. The engine first finishes what it is in the middle of, which takes a few seconds.\n\n"
         "Nothing is deleted: the files on disk and the GitHub repository are untouched. Reconnect any time with \"Open a project\"."
     ),
     'partner': (
@@ -2908,6 +4005,253 @@ class PeoplePicker(ttk.Frame):
         return out
 
 
+class ExclusionWindow(tk.Toplevel):
+    """Choose what stays on this machine before a new project is shared.
+
+    The user's design (2026-10-01): asked at sharing time, with the answer
+    built up in as many rounds as the person likes - one or several files or
+    folders at a time - and a final confirmation at the end. Everything the
+    window shows comes from init-owner's own measurement, re-taken after every
+    change, so the sizes and the large warnings are the ones the setup itself
+    will act on.
+
+    result: None (back out), or {"keep": [paths], "allow_large": bool}.
+    """
+
+    def __init__(self, parent, app, folder, preview, keep=None):
+        super().__init__(parent)
+        self.app = app
+        self.folder = os.path.normpath(folder)
+        self.preview = preview
+        self.keep = list(keep or [])
+        self.result = None
+        self.busy = False
+        self.title("Choose what stays on this machine")
+        self.transient(parent)
+        self.grab_set()
+        self.minsize(720, 560)
+
+        wrap = ttk.Frame(self, padding=(20, 16))
+        wrap.pack(fill="both", expand=True)
+        ttk.Label(wrap, text="What goes to the shared project", font=FONT_H,
+                  foreground=FG).pack(anchor="w")
+        ttk.Label(wrap, text="Everything under \"Shared\" is uploaded for the people you invite. "
+                             "Keep anything that is\nyours alone on this machine - as many times "
+                             "as you like, then press Share.",
+                  font=FONT, foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 10))
+
+        ttk.Label(wrap, text="Shared", font=FONT_B, foreground=FG).pack(anchor="w")
+        self.shared_area = ScrollArea(wrap, height=170)
+        self.shared_area.pack(fill="both", expand=True)
+
+        ttk.Label(wrap, text="Stays on this machine", font=FONT_B,
+                  foreground=FG).pack(anchor="w", pady=(10, 0))
+        self.kept_area = ScrollArea(wrap, height=90)
+        self.kept_area.pack(fill="both", expand=False)
+
+        self.machine_lbl = ttk.Label(wrap, text="", font=FONT, foreground=MUTED,
+                                     justify="left", wraplength=660)
+        self.machine_lbl.pack(anchor="w", pady=(8, 0))
+        self.history_lbl = ttk.Label(wrap, text="", font=FONT, foreground=MUTED,
+                                     justify="left", wraplength=660)
+        self.history_lbl.pack(anchor="w")
+        self.status_lbl = ttk.Label(wrap, text="", font=FONT_B, foreground=FG)
+        self.status_lbl.pack(anchor="w", pady=(8, 0))
+
+        row = ttk.Frame(wrap)
+        row.pack(fill="x", pady=(12, 0))
+        self.btn_files = button(row, "Keep files home...", self._add_files)
+        self.btn_files.pack(side="left")
+        self.btn_folder = button(row, "Keep a folder home...", self._add_folder)
+        self.btn_folder.pack(side="left", padx=(8, 0))
+        self.btn_share = button(row, "Share", self._share, primary=True)
+        self.btn_share.pack(side="right")
+        button(row, "Back", self._back).pack(side="right", padx=(0, 8))
+        self.protocol("WM_DELETE_WINDOW", self._back)
+        self._render()
+
+    # --- what is shown ---------------------------------------------------------
+    def _large_names(self):
+        return {h["item"] for h in self.preview.get("large", [])}
+
+    def _render(self):
+        for area in (self.shared_area, self.kept_area):
+            for c in area.inner.winfo_children():
+                c.destroy()
+        big = self._large_names()
+        items = self.preview.get("items", [])
+        for name, size, files in items:
+            line = ttk.Frame(self.shared_area.inner)
+            line.pack(fill="x", anchor="w")
+            colour = "#ffd7d7" if name in big else FG
+            tag = "   LARGE" if name in big else ""
+            ttk.Label(line, text=latin("%s   %s, %d file(s)%s" % (name, size_text(size), files, tag)),
+                      font=MONO, foreground=colour).pack(side="left")
+            if name not in SHARE_RESERVED:
+                b = button(line, "Keep home", lambda n=name: self._add([n]))
+                b.pack(side="right")
+                if self.busy:
+                    b.state(["disabled"])
+        if not items:
+            ttk.Label(self.shared_area.inner, text="nothing - every file stays on this machine",
+                      font=FONT, foreground=MUTED).pack(anchor="w")
+        for k in self.keep:
+            line = ttk.Frame(self.kept_area.inner)
+            line.pack(fill="x", anchor="w")
+            ttk.Label(line, text=latin(k), font=MONO, foreground=FG).pack(side="left")
+            b = button(line, "Share it after all", lambda k=k: self._remove(k))
+            b.pack(side="right")
+            if self.busy:
+                b.state(["disabled"])
+        if not self.keep:
+            ttk.Label(self.kept_area.inner, text="nothing yet", font=FONT,
+                      foreground=MUTED).pack(anchor="w")
+
+        machine = self.preview.get("machine", [])
+        if machine:
+            total = sum(m[1] for m in machine)
+            names = ", ".join(m[0] for m in machine[:6]) + (" ..." if len(machine) > 6 else "")
+            self.machine_lbl.configure(text=latin(
+                "Left out automatically (%s) - tools rebuild these on every machine: %s"
+                % (size_text(total), names)))
+        else:
+            self.machine_lbl.configure(text="")
+        hist = self.preview.get("history")
+        in_history = [h["item"] for h in self.preview.get("large", []) if h.get("committed")]
+        text = ""
+        if hist:
+            text = ("This folder's own git history goes up as it is: %s in %d commit(s)."
+                    % (size_text(hist[0]), hist[1]))
+        if in_history:
+            text += ("\nLarge, and already in that history (it goes up with it): "
+                     + ", ".join(in_history))
+        self.history_lbl.configure(text=latin(text))
+
+        if self.busy:
+            self.status_lbl.configure(text="measuring...", foreground=MUTED)
+        elif self.preview.get("error"):
+            self.status_lbl.configure(text=latin("Could not measure: " + self.preview["error"][:200]),
+                                      foreground=BAD)
+        else:
+            size = sum(i[1] for i in items)
+            files = sum(i[2] for i in items)
+            self.status_lbl.configure(
+                text="Shared: %d file(s), %s%s" % (files, size_text(size),
+                                                    "  -  large content included" if big else ""),
+                foreground="#ffd7d7" if big else FG)
+        for b in (self.btn_files, self.btn_folder, self.btn_share):
+            b.state(["disabled"] if self.busy else ["!disabled"])
+        if self.preview.get("error") and not self.busy:
+            self.btn_share.state(["disabled"])
+
+    # --- changing it -----------------------------------------------------------
+    def _relative(self, picked):
+        """picked as a path inside the folder, with "/" - or None."""
+        full = os.path.normpath(picked)
+        try:
+            if os.path.commonpath([os.path.normcase(self.folder), os.path.normcase(full)]) \
+                    != os.path.normcase(self.folder):
+                return None
+        except ValueError:          # another drive
+            return None
+        rel = os.path.relpath(full, self.folder).replace(os.sep, "/")
+        return None if rel in (".", "") or rel.startswith("../") else rel
+
+    def _add(self, names):
+        refused = [n for n in names if n.rstrip("/") in SHARE_RESERVED]
+        if refused:
+            messagebox.showinfo(
+                "Stays shared",
+                ", ".join(refused) + " is part of every shared project - the others need it.",
+                parent=self)
+        added = False
+        for n in names:
+            if n.rstrip("/") in SHARE_RESERVED or n in self.keep:
+                continue
+            self.keep.append(n)
+            added = True
+        if added:
+            self._remeasure()
+
+    def _add_files(self):
+        picked = filedialog.askopenfilenames(parent=self, initialdir=self.folder,
+                                             title="Files that stay on this machine")
+        names, outside = [], []
+        for f in picked or ():
+            rel = self._relative(f)
+            (names.append(rel) if rel else outside.append(f))
+        self._outside(outside)
+        if names:
+            self._add(names)
+
+    def _add_folder(self):
+        picked = filedialog.askdirectory(parent=self, initialdir=self.folder, mustexist=True,
+                                         title="A folder that stays on this machine")
+        if not picked:
+            return
+        rel = self._relative(picked)
+        if not rel:
+            self._outside([picked])
+            return
+        self._add([rel.rstrip("/") + "/"])
+
+    def _outside(self, paths):
+        if paths:
+            messagebox.showinfo("Not in this project",
+                                "Only what is inside the project folder can be kept home:\n\n"
+                                + "\n".join(paths), parent=self)
+
+    def _remove(self, k):
+        if k in self.keep:
+            self.keep.remove(k)
+            self._remeasure()
+
+    def _remeasure(self):
+        self.busy = True
+        self._render()
+        keep, folder = list(self.keep), self.folder
+
+        def work():
+            pv = share_preview(folder, keep)
+            self.app.post(lambda: self._measured(keep, pv))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _measured(self, keep, pv):
+        if not self.winfo_exists():
+            return
+        if keep != self.keep:        # changed again meanwhile: the next answer is coming
+            return
+        self.busy = False
+        self.preview = pv
+        self._render()
+
+    # --- the final word ----------------------------------------------------------
+    def _share(self):
+        if self.busy or self.preview.get("error"):
+            return
+        items = self.preview.get("items", [])
+        size = sum(i[1] for i in items)
+        files = sum(i[2] for i in items)
+        large = self.preview.get("large", [])
+        text = ("Share %s now?\n\nShared: %d file(s), %s."
+                % (os.path.basename(self.folder), files, size_text(size)))
+        if self.keep:
+            text += "\nStays on this machine: " + ", ".join(self.keep[:12]) + \
+                    (" ..." if len(self.keep) > 12 else "")
+        if large:
+            text += ("\n\nLARGE content goes up with it, and stays in the project's history "
+                     "for good:\n" + "\n".join("  %s  %s" % (h["item"], size_text(h["bytes"]))
+                                                 for h in large[:10]))
+        if not messagebox.askyesno("Share it?", text, parent=self):
+            return
+        self.result = {"keep": list(self.keep), "allow_large": bool(large)}
+        self.destroy()
+
+    def _back(self):
+        self.result = None
+        self.destroy()
+
+
 class SetupDialog(tk.Toplevel):
     """Collects what init-owner.ps1 / init-friend.ps1 need.
 
@@ -2936,9 +4280,11 @@ class SetupDialog(tk.Toplevel):
         ttk.Label(wrap, text=head, font=FONT_H, foreground=FG).pack(anchor="w")
 
         if mode == "owner":
-            note = ("Everything in the folder, including sub-folders, is uploaded to a\n"
-                    "new PRIVATE repository on your GitHub account. Only the people\n"
-                    "you invite here can see it.\n\n"
+            note = ("The folder, including sub-folders, is uploaded to a new PRIVATE\n"
+                    "repository on your GitHub account. Only the people you invite\n"
+                    "here can see it. You are asked first whether anything should\n"
+                    "stay on this machine; its .gitignore, and what tools rebuild\n"
+                    "(node_modules, Python caches), stay home anyway.\n\n"
                     "A folder with its own git history keeps it, and any GitHub\n"
                     "repository it already had is left alone. A folder this app has\n"
                     "shared before is not shared twice - the people are added to it.")
@@ -3378,6 +4724,112 @@ class AddPeopleWindow(tk.Toplevel):
             pass
 
 
+class LargeWindow(tk.Toplevel):
+    """Large content about to go out, and the two answers to it.
+
+    Once sent it stays in the project's history for good - deleting it later
+    removes it from the folder, never from the history every clone carries.
+    Most of what is that big (installed libraries, caches, build output) can
+    be rebuilt on each machine, so keeping it home is the usual answer; the
+    other is real too, for a big file that IS part of the work.
+
+    A file the team already has cannot be kept home - that would take it out
+    of the project for everybody - so it is shown apart, and only sending
+    (or putting the old version back by hand) answers it.
+    """
+
+    def __init__(self, parent, app, large):
+        super().__init__(parent)
+        self.app = app
+        self.large = list(large)
+        self.new = [h for h in self.large if not h.get("shared")]
+        self.title("Large content waiting for your word")
+        self.transient(parent)
+        self.grab_set()
+        self.minsize(660, 320)
+
+        wrap = ttk.Frame(self, padding=(20, 16))
+        wrap.pack(fill="both", expand=True)
+        ttk.Label(wrap, text="This would upload large content",
+                  font=FONT_H, foreground="#ffd7d7").pack(anchor="w")
+        ttk.Label(wrap, text="Publishing is paused until you say. Once sent, it stays in the "
+                             "project's history for good.\nInstalled libraries, caches and build "
+                             "output can be rebuilt on each machine - keep those home.",
+                  font=FONT, foreground=MUTED, justify="left").pack(anchor="w", pady=(4, 12))
+
+        area = ScrollArea(wrap, height=190)
+        area.pack(fill="both", expand=True)
+        body = area.inner
+
+        def section(title, items, note):
+            if not items:
+                return
+            ttk.Label(body, text=title, font=FONT_B, foreground=FG).pack(anchor="w", pady=(8, 0))
+            ttk.Label(body, text=note, font=FONT, foreground=MUTED,
+                      justify="left").pack(anchor="w", pady=(0, 4))
+            for h in items:
+                where = "   (inside a commit made here)" if h.get("committed") else ""
+                ttk.Label(body, text=latin("   %s   %s, %d file(s)%s"
+                                           % (h["item"], size_text(h["bytes"]), h["files"], where)),
+                          font=MONO, foreground="#ffd7d7").pack(anchor="w")
+
+        section("New to the project", self.new,
+                "Nobody else has these yet.")
+        section("A new version of a file the team already has",
+                [h for h in self.large if h.get("shared")],
+                "Every new version is added to the history in full. Keeping it home is not "
+                "possible - it is part of the project.")
+
+        row = ttk.Frame(wrap)
+        row.pack(fill="x", pady=(14, 0))
+        keep = button(row, "Keep the new ones home" if 0 < len(self.new) < len(self.large)
+                      else "Keep them home", self._keep, primary=True)
+        keep.pack(side="left")
+        if not self.new:
+            keep.state(["disabled"])
+        button(row, "Send them", self._send, danger=True).pack(side="left", padx=(8, 0))
+        button(row, "Decide later", self.destroy).pack(side="right")
+
+    def _keep(self):
+        if any(h.get("committed") for h in self.new):
+            if not messagebox.askyesno(
+                    "Keep them home?",
+                    "Some of this is already inside a commit made on this machine and not "
+                    "sent yet - and a commit would carry it along.\n\n"
+                    "Those unsent commits will be folded into the next one. Every file stays "
+                    "exactly as it is on your disk; nothing of yours is lost.", parent=self):
+                return
+        try:
+            keep_large_home(self.app.repo, self.new)
+        except GuardError as e:
+            messagebox.showerror("Could not keep them home", str(e), parent=self)
+            return
+        self.app.say("kept home: " + ", ".join(h["item"] for h in self.new)
+                     + " - added to the project's .gitignore, which travels to everyone")
+        self.app.refresh_destructive()
+        self.destroy()
+
+    def _send(self):
+        if not messagebox.askyesno(
+                "Send them?",
+                "Upload " + ", ".join(h["item"] for h in self.large) + "?\n\n"
+                "It goes to everyone, and stays in the project's history for good.",
+                parent=self):
+            return
+        approve_large(self.app.repo, self.large)
+        self.app.say("confirmed - large content will publish: "
+                     + ", ".join(h["item"] for h in self.large))
+        self.app.refresh_destructive()
+        self.destroy()
+
+
+def size_text(n):
+    """Bytes as a person reads them."""
+    if n >= 1024 * 1024:
+        return "%.1f MB" % (n / (1024 * 1024))
+    return "%d KB" % max(1, n // 1024)
+
+
 class DestructiveWindow(tk.Toplevel):
     """What is about to destroy work, and the two answers to it.
 
@@ -3627,7 +5079,7 @@ def project_status(path):
         return ("conflict - needs attention", "bad")
     dirty = bool(git(path, "status", "--porcelain"))
     ahead = git(path, "rev-list", "--count", "origin/main..HEAD") or "0"
-    engine = daemon_pid(path) is not None
+    engine = ENGINES.running(path)       # a project mid-restart is not "off"
     if dirty or ahead != "0":
         what = (ahead + " unpublished") if ahead != "0" else "unsaved changes"
         return (what + (", syncing" if engine else ", engine off"), "warn")
@@ -3646,10 +5098,14 @@ class ProjectChooser(tk.Toplevel):
     nothing at all.
     """
 
-    def __init__(self, parent, projects):
+    def __init__(self, parent, projects, running=()):
         super().__init__(parent)
         self.result = None
         self.projects = list(projects)
+        # Engines running for folders that are NOT on the list - taken off it
+        # while their engine ran on. They used to sync out of sight, with no
+        # way back to them but Browse: a test project did that for a day.
+        self.running = list(running)
         self.title("Open a project")
         self.transient(parent)
         self.grab_set()
@@ -3660,7 +5116,8 @@ class ProjectChooser(tk.Toplevel):
 
         ttk.Label(wrap, text="Projects on this machine", font=FONT_H).pack(anchor="w")
         hint = ("Double-click one, or select it and press Open."
-                if self.projects else "Nothing has been opened on this machine yet.")
+                if (self.projects or self.running)
+                else "Nothing has been opened on this machine yet.")
         ttk.Label(wrap, text=hint, foreground=MUTED).pack(anchor="w", pady=(2, 12))
 
         holder = ttk.Frame(wrap)
@@ -3704,7 +5161,12 @@ class ProjectChooser(tk.Toplevel):
             state, tag = project_status(path)
             self.tree.insert("", "end", text=" " + name, image=self._lamps[tag],
                              values=(latin(state), path), tags=(tag,))
-        if self.projects:
+        for path in self.running:
+            name = os.path.basename(path.rstrip(chr(92) + "/")) or path
+            self.tree.insert("", "end", text=" " + name, image=self._lamps["warn"],
+                             values=(latin("syncing - not on your list"), path),
+                             tags=("warn",))
+        if self.tree.get_children():
             first = self.tree.get_children()[0]
             self.tree.selection_set(first)
             self.tree.focus(first)
@@ -3786,7 +5248,7 @@ class App(tk.Tk):
 
         self.cfg = load_config()
         self.repo = self.cfg.get("last_project") or ""
-        self.proc = None            # engine started by THIS window (else adopted by pid)
+        ENGINES.opened()            # engines are kept per project there, not here
         self.lines = queue.Queue()
         # Work handed back from background threads. `after` is NOT safe to
         # call from another thread - it registers a Tcl command on the
@@ -3808,6 +5270,7 @@ class App(tk.Tk):
         self._poll_busy = False
         self._partner_snap = None      # the last finished look at the team
         self._destructive = {"deleted": [], "reverted": []}
+        self._large = []
         self._destructive_busy = False
         self._destructive_again = False
         self._setting_up = False       # a share or a join is writing the folder
@@ -3877,6 +5340,11 @@ class App(tk.Tk):
                 self._show_note(
                     f"The last project is not at this path any more:\n{remembered}\nIf you moved the folder, use \"Open a project already on this machine\" to point at its new location. Nothing has been lost.",
                     "moved")
+
+        # After the project above has had its own engine seen to, so the two
+        # never reach for the same one (ENGINES.claim settles it either way).
+        if SWEEP_ENGINES_AT_START:
+            self.after(1000, self._sweep_engines)
 
     # -- layout ------------------------------------------------------------
 
@@ -4296,15 +5764,20 @@ class App(tk.Tk):
             self._destructive_again = False
             self.refresh_destructive()
 
-    def _apply_destructive(self, changes, approved):
+    def _apply_destructive(self, changes, approved, large=None, large_ok=""):
         held = list(changes.get("deleted", [])) + list(changes.get("reverted", []))
         # Already confirmed is not "waiting for you" - the button must not sit
         # lit after the person has answered.
         if held and approved and approved == destructive_signature(changes):
             held = []
         self._destructive = changes if held else {"deleted": [], "reverted": []}
-        if held:
-            self.btn_destructive.configure(text="Needs your OK (%d)" % len(held))
+        large = list(large or [])
+        if large and large_ok and large_ok == large_signature(large):
+            large = []
+        self._large = large
+        n = len(held) + len(large)
+        if n:
+            self.btn_destructive.configure(text="Needs your OK (%d)" % n)
             self.btn_destructive.state(["!disabled"])
         else:
             self.btn_destructive.configure(text="Needs your OK")
@@ -4312,12 +5785,16 @@ class App(tk.Tk):
         self._paint_now()
 
     def _show_destructive(self):
+        """What waits for the person's word: destroying work first - it is the
+        one that loses something - then large new content."""
         changes = getattr(self, "_destructive", None)
-        if not changes or not (changes.get("deleted") or changes.get("reverted")):
+        if changes and (changes.get("deleted") or changes.get("reverted")):
+            DestructiveWindow(self, self, changes)
+        elif getattr(self, "_large", None):
+            LargeWindow(self, self, self._large)
+        else:
             messagebox.showinfo("Nothing is held",
                                 "Nothing is waiting for your word right now.", parent=self)
-            return
-        DestructiveWindow(self, self, changes)
 
     def _add_people(self, repo=None):
         """Invite people to ONE project - the open one, or one chosen first."""
@@ -4527,85 +6004,208 @@ class App(tk.Tk):
     # -- daemon ------------------------------------------------------------
 
     def sync_running(self):
-        if self.proc is not None and self.proc.poll() is None:
-            return True
-        return bool(self.repo) and daemon_pid(self.repo) is not None
+        return ENGINES.running(self.repo)
 
     def start_sync(self):
         if not self.repo:
             return
-        if self.sync_running():
+        repo = self.repo
+        if ENGINES.stopping(repo):
+            self.say("the sync engine is still stopping - start it again once it has", "warn")
+            self._paint_sync_button()
+            return
+        if ENGINES.replacing(repo):
+            # The startup sweep is already moving this engine onto this build.
+            self.say("the sync engine is being restarted on " + latin(APP_VERSION)
+                     + " - it carries on in a moment", "warn")
+            self._paint_sync_button()
+            return
+        ours = ENGINES.ours(repo)
+        pid = None if ours is not None else daemon_pid(repo)
+        if ours is not None or pid is not None:
             # An engine from a previous window is still covering this folder -
             # but an engine deliberately outlives windows, which means it can
             # outlive UPDATES and keep running last week's code with none of
             # the new behavior, silently. Field-found: a leftover engine ran
             # 2.0.7 rules under a 2.0.15 app. Same version: adopt it. Any
             # other answer (or none - engines before 2.0.16 did not say):
-            # replace it with one running this build's code.
-            running = daemon_state(self.repo).get("version", "")
-            if running == APP_VERSION:
+            # replace it with one running this build's code. One this app
+            # started itself is this build by construction, heartbeat or not.
+            # And a heartbeat that came along with a MOVED folder vouches for
+            # an engine still working on the old path: replaced too.
+            serves = True if ours is not None else engine_serves(pid, repo)
+            running = (APP_VERSION if ours is not None
+                       else daemon_state(repo).get("version", ""))
+            if running == APP_VERSION and serves is not False:
+                # A stop asked for earlier and not yet taken - before the app
+                # was closed, say - is taken back: opening a project has always
+                # meant syncing it.
+                withdraw_stop_request(repo)
                 self.say("sync engine already running in the background - reconnected", "ok")
-                self.btn_sync.config(text="Stop sync")
+                self._paint_sync_button()
                 return
-            self.say("engine was running older code - restarting it on "
-                     + latin(APP_VERSION), "warn")
-            pid = daemon_pid(self.repo)
-            if pid:
-                kill_pid(pid)
-            try:
-                os.remove(os.path.join(self.repo, ".teamsync.lock"))
-            except OSError:
-                pass
-        script = resource_path("engine", "teamsync.ps1")
-        if not os.path.exists(script):
+            if serves is False:
+                self.say("this folder was moved while its engine ran - that engine "
+                         "stops at its old place, and syncing starts here", "warn")
+            else:
+                self.say("engine was running older code - restarting it on "
+                         + latin(APP_VERSION), "warn")
+            # Off this thread, the same way the startup sweep does it: the old
+            # engine is stopped only at rest between two passes, never in the
+            # middle of its work - a wait the window must not spend frozen.
+            if ENGINES.claim(repo):
+                threading.Thread(target=self._replace_worker, args=(repo, True),
+                                 daemon=True).start()
+            self._paint_sync_button()
+            return
+        if not os.path.exists(engine_script()):
             explain('The sync engine could not be found.',
                     'A file that ships inside the program is not where it should be. Usually the program file was copied incompletely, or antivirus quarantined part of it.',
                     'Close the app and open it again. If it keeps happening, get a fresh copy from Amin.')
             return
-        # DETACHED on purpose: no pipes to this window, so closing the window can
-        # never break or stop the engine. Its output reaches us via the log file.
         try:
-            self.proc = subprocess.Popen(
-                [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
-                 "-Path", self.repo, "-NoPopup", "-AppVersion", APP_VERSION],
-                cwd=self.repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
-            )
+            ENGINES.start(repo)
         except Exception as exc:
             explain('Syncing could not be started.',
                     f'Windows refused: {exc}',
                     'Close the app and open it again. If it repeats, check that git is installed - run  git --version  in a terminal.')
             return
-        self.btn_sync.config(text="Stop sync")
+        self._paint_sync_button()
         self.pill.set("syncing", ACCENT)
         self.say("sync engine started", "ok")
 
-    def stop_sync(self, quiet=False):
-        stopped = False
-        # Tell the other side we are going, before the engine is killed - a killed
-        # process cannot announce its own departure.
-        if self.repo and self.sync_running():
+    def stop_sync(self, quiet=False, then=None):
+        self._stop_project(self.repo, quiet=quiet, then=then)
+
+    def _stop_project(self, repo, quiet=False, then=None):
+        """Turn syncing off for one project - the open one, or one being moved
+        or taken off the list - and for that project only (see Engines).
+
+        Its engine stops at rest, never in the middle of a git command: asked
+        to stop itself when it understands that, watched from outside and
+        ended in its rest when it does not. That takes a few seconds, so the
+        window says "Stopping..." meanwhile and stays usable. `then(outcome)`
+        runs on this thread once the engine has gone.
+        """
+        if not repo:
+            if then:
+                then("none")
+            return
+        # Tell the other side we are going - an engine ended from outside
+        # cannot announce its own departure.
+        if ENGINES.running(repo):
             threading.Thread(target=clear_my_presence,
-                             args=(self.repo, presence_name(self.repo)), daemon=True).start()
-        if self.proc is not None and self.proc.poll() is None:
-            kill_pid(self.proc.pid)
-            stopped = True
-        self.proc = None
-        if self.repo:
-            pid = daemon_pid(self.repo)
-            if pid:
-                kill_pid(pid)
-                stopped = True
-            try:
-                os.remove(os.path.join(self.repo, ".teamsync.lock"))
-            except OSError:
-                pass
-        self.btn_sync.config(text="Start sync")
-        self.pill.set("stopped", MUTED)
-        if stopped and not quiet:
+                             args=(repo, presence_name(repo)), daemon=True).start()
+
+        def done(outcome):
+            self.post(lambda: self._stopped(repo, outcome, quiet, then))
+        if not ENGINES.stop(repo, done=done):
+            self._stopped(repo, "none", quiet, then)
+            return
+        if not quiet:
+            self.say("stopping sync - the engine first finishes what it is in the middle of", "warn")
+        if repo == self.repo:
+            self.pill.set("stopping...", WARN)
+            self._paint_sync_button()
+
+    def _stopped(self, repo, outcome, quiet, then):
+        name = os.path.basename(repo.rstrip("\\/")) or repo
+        if outcome == "killed":
+            self.say(f"the sync engine of {name} never came to rest in {REPLACE_WAIT} s, "
+                     f"so it was stopped where it stood", "warn")
+        if repo == self.repo:
+            self._paint_sync_button()
+            if not self.sync_running():
+                self.pill.set("stopped", MUTED)
+        if outcome != "none" and not quiet:
             self.say("sync stopped - nothing is sent or received until you start it again", "warn")
+        if then:
+            then(outcome)
+
+    def _paint_sync_button(self):
+        """Stop sync, Start sync - or Stopping..., and not pressable meanwhile."""
+        if self.repo and ENGINES.stopping(self.repo):
+            self.btn_sync.config(text="Stopping...")
+            self.btn_sync.state(["disabled"])
+            return
+        self.btn_sync.state(["!disabled"])
+        self.btn_sync.config(text="Stop sync" if self.sync_running() else "Start sync")
+
+    def _sweep_engines(self):
+        """At start: move every engine still running older code onto this build.
+
+        An engine deliberately outlives its window, so it outlives UPDATES too,
+        and start_sync replaces one only when its own project is opened. Found
+        2026-10-01: the engine of a test project ran 2.1.9 code - marker refs
+        pushed from HEAD, carrying unsent commits to GitHub - for a day under
+        2.2.0, because nobody opened that project. An update restarts the app,
+        so this runs after every update as well. All the looking and waiting
+        happens off this thread; the window only prints the result.
+
+        A project whose engine is not running is left exactly so: the person
+        turned it off, or never turned it on.
+        """
+        listed = [e.get("path", "") for e in self.cfg.get("projects", [])]
+        threading.Thread(target=self._sweep_worker, args=(listed,), daemon=True).start()
+
+    def _sweep_worker(self, listed):
+        try:
+            stale = stale_engines(listed)
+        except Exception as exc:
+            self.lines.put(f"could not check the sync engines of the other projects: {exc}")
+            return
+        for repo in stale:
+            # A project the window has just opened may already be under way.
+            if ENGINES.claim(repo):
+                threading.Thread(target=self._replace_worker, args=(repo,),
+                                 daemon=True).start()
+
+    def _replace_worker(self, repo, start_anyway=False):
+        """Worker thread: one engine moved onto this build, one line about it."""
+        try:
+            outcome, old, detail = ENGINES.replace(repo, start_anyway=start_anyway)
+        except Exception as exc:
+            outcome, old, detail = "failed", "", str(exc)
+        name = os.path.basename(repo.rstrip("\\/")) or repo
+        was = ("v" + old) if old else "an older version"
+        now = "v" + APP_VERSION
+        if outcome == "restarted" and old == APP_VERSION:
+            # Same version: it was replaced because it worked on the folder's
+            # old place (a folder moved while its engine ran).
+            line, tag = f"the sync engine of {name} now works from the folder's new place", "ok"
+        elif outcome == "restarted":
+            line, tag = (f"restarted the sync engine of {name} on {now} - "
+                         f"it was still running {was}"), "ok"
+        elif outcome == "started":
+            line, tag = (f"the old sync engine of {name} had stopped by itself - "
+                         f"started one on {now}"), "ok"
+        elif outcome == "busy":
+            line, tag = (f"the sync engine of {name} is still on {was}: it was at work "
+                         f"the whole {REPLACE_WAIT} s, and an engine is never stopped in the "
+                         f"middle of its work - it is replaced at the next start of the app, "
+                         f"or when {name} is opened"), "warn"
+        elif outcome == "failed":
+            line, tag = (f"could not restart the sync engine of {name} ({detail}) - it "
+                         f"runs on as before, on {was}"), "warn"
+        elif outcome == "lost":
+            line, tag = (f"the sync engine of {name} was stopped to move it to {now}, but "
+                         f"the new one could not be started: {detail} - {name} is NOT "
+                         f"syncing now; open it to start syncing again"), "bad"
+        elif outcome == "died":
+            line, tag = (f"restarted the sync engine of {name} on {now}, but the new one "
+                         f"stopped at once ({detail}) - {name} is NOT syncing now; open "
+                         f"it to see why"), "bad"
+        elif outcome == "slow":
+            line, tag = (f"restarted the sync engine of {name} on {now}, but it has not "
+                         f"reported back in {ENGINE_UP_WAIT} s - open {name} to check "
+                         f"it is syncing"), "warn"
+        else:
+            return          # nothing to replace, or the person stopped it
+        self.post(lambda: self.say(line, tag))
 
     def toggle_sync(self):
+        if self.repo and ENGINES.stopping(self.repo):
+            return                  # already on its way off; the button says so
         if not self.sync_running():
             self.start_sync()
             return
@@ -4803,6 +6403,12 @@ class App(tk.Tk):
         A moved folder used to mean closing the window, or going Home - and that
         can leave a dead path behind. This changes the location in place: the old
         engine is stopped, the new one starts where the files actually are.
+
+        In that order, and the second only once the first is done: the old
+        engine stops at rest, which takes a moment, and one worktree gets one
+        engine. A folder MOVED while its engine ran leaves that engine working
+        on a path that no longer exists - it stops by itself within seconds
+        (measured: two), and start_sync waits it out.
         """
         old = self.repo
         p = self._pick_project("Where is the project now?")
@@ -4817,7 +6423,6 @@ class App(tk.Tk):
                           "every shared project carries (push-now.ps1, "
                           "TEAM-PROJECT-REFERENCE.md)." + NN + p + NN + "Nothing was changed.")
             return
-        self.stop_sync(quiet=True)
         # The project moved - it did not become a second project. Drop the old
         # entry, or the list keeps a dead row pointing at a folder that is gone.
         if old:
@@ -4828,7 +6433,11 @@ class App(tk.Tk):
         save_config(self.cfg)
         self._show_project()
         self.say(f"project location changed to {p}", "warn")
-        self.start_sync()
+
+        def then(_outcome):
+            if self.repo == p:
+                self.start_sync()
+        self._stop_project(old, quiet=True, then=then)
 
     def _switch(self):
         """Home: back to the first screen.
@@ -4851,14 +6460,22 @@ class App(tk.Tk):
             "The files on disk and the GitHub repository are left untouched.",
         ):
             return
-        self.stop_sync(quiet=True)
-        forget_project(self.cfg, self.repo)
-        if self.cfg.get("last_project") == self.repo:
+        repo = self.repo
+        running = ENGINES.running(repo)
+        forget_project(self.cfg, repo)
+        if self.cfg.get("last_project") == repo:
             self.cfg.pop("last_project", None)
         save_config(self.cfg)
-        self.say(f"disconnected from {name}", "warn")
+        self.say(f"disconnected from {name}" + (
+            " - its sync engine stops as soon as it has finished what it is in "
+            "the middle of" if running else ""), "warn")
         self.repo = ""
         self._show_welcome()
+
+        def then(outcome):
+            if outcome != "none":
+                self.say(f"the sync engine of {name} has stopped", "warn")
+        self._stop_project(repo, quiet=True, then=then)
 
     def _make_shortcut(self):
         ok, detail = create_desktop_shortcut()
@@ -5001,16 +6618,15 @@ class App(tk.Tk):
 
     def _open_existing(self):
         """Show what has been opened before. Browsing is the fallback, not the ritual."""
-        dlg = ProjectChooser(self, self.cfg.get("projects", []))
+        dlg = ProjectChooser(self, self.cfg.get("projects", []),
+                             running=unlisted_engines(self.cfg))
         self.wait_window(dlg)
         if not dlg.result:
             return
         action, path = dlg.result
 
         if action == "forget":
-            forget_project(self.cfg, path)
-            save_config(self.cfg)
-            self.say(f"removed {path} from the list - nothing on disk was touched", "warn")
+            self._forget_project(path)
             return self._open_existing()
 
         if action == "open" and not os.path.isdir(os.path.join(path, ".git")):
@@ -5036,6 +6652,46 @@ class App(tk.Tk):
         save_config(self.cfg)
         self._show_project()
         self.start_sync()
+
+    def _forget_project(self, path):
+        """The chooser's Remove from list.
+
+        It used to take the project off the list and nothing else - and an
+        engine running for it ran on, out of sight, with no way back to it
+        but Browse. A test project synced like that for a day. So when its
+        engine runs, the person is asked whether its syncing stops too.
+        """
+        name = os.path.basename(path.rstrip("\\/")) or path
+        listed = any(os.path.normcase(os.path.normpath(e.get("path", "")))
+                     == os.path.normcase(os.path.normpath(path))
+                     or _same_folder(e.get("path", ""), path)
+                     for e in self.cfg.get("projects", []) if e.get("path"))
+        if ENGINES.running(path):
+            if listed:
+                answer = messagebox.askyesnocancel(
+                    APP_NAME,
+                    f"{name} is still syncing in the background." + NN +
+                    "Yes: stop syncing it too, and remove it from the list." + N +
+                    "No: only remove it from the list - it keeps syncing, out of sight." + N +
+                    "Cancel: do nothing.")
+            else:
+                answer = messagebox.askyesno(
+                    APP_NAME,
+                    f"{name} is not on your list, but it is still syncing in the "
+                    "background." + NN + "Stop syncing it?") or None
+            if answer is None:
+                return
+            if answer:
+                def then(outcome):
+                    if outcome != "none":
+                        self.say(f"the sync engine of {name} has stopped", "warn")
+                self.say(f"stopping the sync engine of {name} - it first finishes "
+                         "what it is in the middle of", "warn")
+                self._stop_project(path, quiet=True, then=then)
+        if listed:
+            forget_project(self.cfg, path)
+            save_config(self.cfg)
+            self.say(f"removed {path} from the list - nothing on disk was touched", "warn")
 
     # -- setup -------------------------------------------------------------
 
@@ -5105,6 +6761,67 @@ class App(tk.Tk):
                 else:
                     messagebox.showinfo(APP_NAME, "Nobody was ticked, so nobody was invited.")
                 return
+        self._choose_what_to_share(v)
+
+    def _choose_what_to_share(self, v):
+        """Before a NEW project is made: keep something on this machine, or
+        share automatically? (the user's design, 2026-10-01). Either way the
+        folder is measured first, and large content is never uploaded without
+        the person having seen it."""
+        folder = os.path.normpath(v["path"])
+        answer = messagebox.askyesnocancel(
+            APP_NAME,
+            "Before " + os.path.basename(folder) + " is shared:" + NN +
+            "Do you want to keep some files or folders on this machine only?" + NN +
+            "Yes: choose them - you see everything that would be shared, with sizes." + NN +
+            "No: share automatically. The folder's .gitignore applies, and what tools "
+            "rebuild (node_modules, Python caches) stays home." + NN +
+            "Cancel: do nothing.")
+        if answer is None:
+            return
+        self.configure(cursor="watch")
+        self.say("measuring what would be shared...")
+
+        def work():
+            pv = share_preview(folder, [])
+            self.post(lambda: self._share_measured(v, bool(answer), pv))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _share_measured(self, v, choose, pv):
+        self.configure(cursor="")
+        if pv.get("error"):
+            messagebox.showerror(APP_NAME, "Could not measure what would be shared - nothing "
+                                           "was changed:" + NN + pv["error"][:800])
+            return
+        if not choose and pv.get("large"):
+            answer = messagebox.askyesnocancel(
+                APP_NAME,
+                "This would upload LARGE content - once uploaded it stays in the "
+                "project's history for good:" + NN +
+                "\n".join("  %s  %s%s" % (h["item"], size_text(h["bytes"]),
+                                           "  (already in the folder's history)"
+                                           if h.get("committed") else "")
+                           for h in pv["large"][:12]) + NN +
+                "Yes: choose what stays on this machine." + N +
+                "No: upload it anyway." + N +
+                "Cancel: do nothing.")
+            if answer is None:
+                return
+            if answer is False:
+                v["allow_large"] = True
+                self._run_setup("owner", v, None)
+                return
+            choose = True
+        if not choose:
+            self._run_setup("owner", v, None)
+            return
+        win = ExclusionWindow(self, self, v["path"], pv)
+        self.wait_window(win)
+        if not win.result:
+            self.say("sharing cancelled - nothing was changed")
+            return
+        v["exclude"] = win.result["keep"]
+        v["allow_large"] = win.result["allow_large"]
         self._run_setup("owner", v, None)
 
     def _invite_into(self, slug, people, box=False):
@@ -5135,6 +6852,10 @@ class App(tk.Tk):
                 cmd += ["-RepoName", v["reponame"]]
             if v.get("friend"):
                 cmd += ["-Friend", v["friend"]]
+            if v.get("exclude"):
+                cmd += ["-Exclude", exclude_arg(v["exclude"])]
+            if v.get("allow_large"):
+                cmd += ["-AllowLarge"]
         else:
             cmd += ["-RepoName", v["reponame"], "-Path", v["path"]]
             if v.get("owner"):
@@ -5299,11 +7020,13 @@ class App(tk.Tk):
             return
 
         self.banner.pack_forget()
+        self._paint_sync_button()
+        if ENGINES.stopping(self.repo):
+            self.pill.set("stopping...", WARN)
+            return
         if not self.sync_running():
             self.pill.set("stopped", MUTED)
-            self.btn_sync.config(text="Start sync")
             return
-        self.btn_sync.config(text="Stop sync")
         ahead = snap["ahead"] or "0"
         if snap["net"] == "offline":
             # Offline is not a failure state: work is committed locally and the
@@ -5362,6 +7085,10 @@ class App(tk.Tk):
         if n_held:
             rows.append((BAD, "waiting for your word",
                          held.get("deleted", []) + held.get("reverted", [])))
+        large = getattr(self, "_large", None) or []
+        if large:
+            rows.append((BAD, "large - waiting for your word",
+                         ["%s  %s" % (h["item"], size_text(h["bytes"])) for h in large]))
         self._set_now(rows)
 
     def _set_now(self, rows):
@@ -5647,7 +7374,7 @@ class App(tk.Tk):
         if self.repo and (git(self.repo, "rev-list", "--count", "origin/main..HEAD") or "0") != "0":
             return          # unpublished work in flight; wait for the next tick
         # The engine is bundled in the exe too, so it has to come up again on the
-        # new code. Work is already in local commits, so stopping is safe.
+        # new code - the new copy's startup sweep sees to that, at rest.
         repo = self.repo
         # Say it before doing it. The window vanishing and coming back with no
         # warning looks exactly like a crash to someone who was not told.
@@ -5663,13 +7390,19 @@ class App(tk.Tk):
         self.after(1800, lambda: self._finish_update(repo))
 
     def _finish_update(self, repo):
-        # The engine runs out of the folder we are about to replace, so it has to
-        # let go first. The new copy starts it again.
-        self.stop_sync(quiet=True)
+        # No engine is stopped here - not this project's either. This used to
+        # stop it first, "insurance" by its own record (STATE section 5): an
+        # engine does not hold the folder being replaced. And that stop ended
+        # it wherever it stood - a git child was running in 89-96% of samples
+        # on the live engines, so nearly always in the middle of a command,
+        # at every update. The new copy's startup sweep now moves every engine
+        # onto it at rest instead. One caught mid-swap is finished first.
+        ENGINES.close()
         if apply_update(self._update_ready):
             self.destroy()
             os._exit(0)          # the helper waits for this pid; die now, not at GC's leisure
         else:
+            ENGINES.opened()
             self.lines.put("could not swap the program file - will retry later")
             explain('The update did not finish.',
                     'The program file could not be swapped for the new one. Usually that means antivirus is holding the file, '
@@ -5694,6 +7427,9 @@ class App(tk.Tk):
             )
             self.cfg["bg_notice_shown"] = True
             save_config(self.cfg)
+        # An engine the startup sweep has just stopped is started again on this
+        # build before the process goes; one it has not reached is left as is.
+        ENGINES.close()
         self.destroy()
 
 

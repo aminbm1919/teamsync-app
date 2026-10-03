@@ -81,6 +81,11 @@ if ($running) {
     Write-Host "Another sync for this folder is already running (PID $running). Nothing to do."
     exit 0
 }
+# A request to stop is addressed to the engine that was running when it was
+# written. Left over, it would stop this one the moment it started - so it goes,
+# and only now: a second engine refused above must not take the first one's.
+Remove-Item -LiteralPath $script:SC_StopSignal -Force -ErrorAction SilentlyContinue
+$script:TS_StopMode = ''
 
 $global:TS_LastChange = $null
 # The quiet window measures from the last change - but with no change seen yet
@@ -229,6 +234,17 @@ try {
         if (-not (Test-Path -LiteralPath $repo)) {
             Write-Host "Project folder is gone: $repo" -ForegroundColor Yellow
             Write-Host 'Stopping. Open the project at its new location in the app.' -ForegroundColor Yellow
+            break
+        }
+
+        # Asked to stop, by the app. Here, at the top of a pass, the engine is
+        # between two of its git commands by construction - see
+        # Receive-StopRequest for why that is the only safe place.
+        $script:TS_StopMode = Receive-StopRequest
+        if ($script:TS_StopMode) {
+            $why = 'stopping - asked to by the app'
+            if ($script:TS_StopMode -eq 'restart') { $why = 'restarting on the newer build of the app' }
+            Write-Log $why 'Yellow'
             break
         }
 
@@ -506,8 +522,13 @@ try {
     }
 }
 finally {
-    Clear-Pending
-    Clear-Presence
+    # A restart is not a departure: the new engine announces the same presence
+    # and the same files within seconds. Withdrawing them first would only
+    # show the teammates an "offline" that never happened.
+    if ($script:TS_StopMode -ne 'restart') {
+        Clear-Pending
+        Clear-Presence
+    }
     Get-EventSubscriber | Where-Object { $_.SourceObject -eq $fsw } | Unregister-Event
     $fsw.EnableRaisingEvents = $false
     $fsw.Dispose()

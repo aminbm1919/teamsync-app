@@ -20,6 +20,9 @@ function Initialize-SyncCore {
     $script:SC_ConflictRoot = Join-Path $Repo '_conflicts'
     $script:SC_Lock         = Join-Path $Repo '.teamsync.lock'
     $script:SC_Signal       = Join-Path $Repo '.teamsync-push-now'
+    # Inside .git, not beside the work: nothing there is ever committed, and
+    # the file watcher ignores it - so a request to stop can never travel.
+    $script:SC_StopSignal   = Join-Path (Join-Path $Repo '.git') 'teamsync-stop'
     $script:SC_Offline      = $false
     $script:SC_PendingPublish = 0
     Set-GitOutputUtf8
@@ -244,6 +247,25 @@ function Test-DaemonAlive {
     return 0
 }
 
+function Receive-StopRequest {
+    # Has the app asked this engine to stop? '' if not; 'stop' for the
+    # person's Stop sync, Disconnect or a move; 'restart' when the app moves it
+    # onto a newer build. Asked at the top of a pass, at rest - never in the
+    # middle of a git command, which the app cannot see from outside: ended
+    # mid-command, git can leave its lock files or a rebase half done.
+    #
+    # The request is TAKEN by deleting it, and the app withdraws one the same
+    # way, so whichever delete succeeds decides: a request the app took back
+    # is never half acted on.
+    $f = $script:SC_StopSignal
+    if (-not $f -or -not (Test-Path -LiteralPath $f)) { return '' }
+    $what = ''
+    try { $what = [IO.File]::ReadAllText($f).Trim() } catch { }
+    try { Remove-Item -LiteralPath $f -Force -ErrorAction Stop } catch { return '' }
+    if ($what -eq 'restart') { return 'restart' }
+    return 'stop'
+}
+
 function Update-Heartbeat {
     # Lets push-now.ps1 (and the UI) know a daemon is alive and listening.
     try {
@@ -260,6 +282,9 @@ function Update-Heartbeat {
             # Test-DaemonAlive.
             "started=$($script:SC_StartTime)"
             "version=$($script:SC_AppVersion)"
+            # This engine stops itself when asked (Receive-StopRequest), so
+            # the app asks instead of choosing a moment to end it from outside.
+            "stop=signal"
             "time=$((Get-Date).ToString('o'))"
             "branch=$($script:SC_Branch)"
             "net=$(if ($script:SC_Offline) { 'offline' } else { 'online' })"
@@ -333,6 +358,22 @@ function Get-MyGitHubLogin {
     $script:SC_Login
 }
 
+function Get-MarkerSource {
+    # What a marker ref - identity, presence, a pending file, a conflict -
+    # points at. Only its NAME carries the news, but pushing it uploads
+    # whatever it points at that GitHub does not have yet, and every
+    # teammate's fetch downloads it again. These used to point at HEAD, which
+    # can hold commits made here and not yet sent: something committed by
+    # hand reached GitHub and every teammate through a heartbeat, without
+    # ever passing the publish guards. The shared branch's tip is already
+    # there, so a marker carries nothing. '' when the project has no shared
+    # branch yet - then there is nothing to point at, and no marker is sent.
+    $src = "refs/remotes/origin/$($script:SC_Branch)"
+    git rev-parse -q --verify $src 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { return $src }
+    return ''
+}
+
 function Publish-Identity {
     # Say which GitHub account is behind this name.
     #
@@ -348,7 +389,9 @@ function Publish-Identity {
     if (-not $me -or -not $login) { return }
     $ref = "refs/teamsync/identity/$me/$login"
     if ($script:SC_IdentityRef -eq $ref) { return }
-    git push -q origin "HEAD:$ref" 2>$null | Out-Null
+    $src = Get-MarkerSource
+    if (-not $src) { return }
+    git push -q origin "${src}:$ref" 2>$null | Out-Null
     if ($LASTEXITCODE -eq 0) { $script:SC_IdentityRef = $ref }
 }
 
@@ -495,7 +538,9 @@ function Publish-Presence {
     $new = "refs/teamsync/presence/$me/$(Get-MachineId)/$ts"
     $old = $script:SC_MyPresenceRef
 
-    git push -q origin "HEAD:$new" 2>$null | Out-Null
+    $src = Get-MarkerSource
+    if (-not $src) { return }
+    git push -q origin "${src}:$new" 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { return }          # offline; try again next tick
     Set-MyLastPresenceRef $new
 
@@ -705,9 +750,10 @@ function Publish-Pending {
     # minute. Breathe between them: the heartbeat is what tells the window and
     # push-now that this engine is alive, and letting it go quiet during
     # ordinary work is what made a healthy engine look dead.
+    $src = Get-MarkerSource
     foreach ($r in $want.Keys) {
-        if (-not $have.ContainsKey($r)) {
-            git push -q origin "HEAD:$r" 2>$null | Out-Null
+        if ($src -and -not $have.ContainsKey($r)) {
+            git push -q origin "${src}:$r" 2>$null | Out-Null
             Update-Heartbeat
         }
     }
@@ -750,8 +796,9 @@ function Publish-Conflict {
     }
     if ($LASTEXITCODE -ne 0) { return }          # offline: try again next tick
 
+    $src = Get-MarkerSource
     foreach ($r in $want.Keys) {
-        if (-not $have.ContainsKey($r)) { git push -q origin "HEAD:$r" 2>$null | Out-Null; Update-Heartbeat }
+        if ($src -and -not $have.ContainsKey($r)) { git push -q origin "${src}:$r" 2>$null | Out-Null; Update-Heartbeat }
     }
     foreach ($r in $have.Keys) {
         if (-not $want.ContainsKey($r)) { git push -q origin ":$r" 2>$null | Out-Null; Update-Heartbeat }
@@ -771,11 +818,29 @@ function Publish-ConflictWork {
     # It points at the pre-rebase tip, which git records for us: mid-rebase
     # HEAD is somewhere in the middle of the replay and would show a partial
     # picture.
+    #
+    # Those commits travel to GitHub and into every teammate's fetch - an
+    # upload like a publish - so large content in them that nobody agreed to
+    # send keeps MINE here. The conflict itself is still announced.
     $me = Get-PresenceName
     if (-not $me) { return }
     $ref = "refs/teamsync/conflictwork/$me"
     $orig = Get-RebaseOrigHead
     if (-not $orig) { git push -q origin ":$ref" 2>$null | Out-Null; return }
+    try {
+        $large = @(Get-LargeOutgoingIn -Root $script:SC_Repo -Upstream "refs/remotes/origin/$($script:SC_Branch)" -Tip $orig -CommittedOnly)
+    } catch {
+        return
+    }
+    if ($large.Count -gt 0 -and -not (Test-LargeApproved $large)) {
+        $sig = Get-LargeSignature $large
+        if ($script:SC_ConflictLargeSaid -ne $sig) {
+            $script:SC_ConflictLargeSaid = $sig
+            Write-Log "your side of the conflict stays on this machine - it carries large content nobody agreed to send: $(@($large | ForEach-Object { $_.Item }) -join ', ')" 'Yellow'
+        }
+        git push -q origin ":$ref" 2>$null | Out-Null
+        return
+    }
     git push -q -f origin "${orig}:$ref" 2>$null | Out-Null
 }
 
@@ -920,12 +985,17 @@ function Initialize-EmptyProject {
     if (Test-Path -LiteralPath $ignore) {
         $have = @([IO.File]::ReadAllText($ignore) -split "`r?`n")
     }
-    $add = @($needed | Where-Object { $have -notcontains $_ })
-    if ($add.Count -gt 0) {
-        $text = (($have + $add) | Where-Object { $_ -ne '' }) -join "`r`n"
-        [IO.File]::WriteAllText($ignore, $text + "`r`n", (New-Object Text.UTF8Encoding($false)))
+    if (@($needed | Where-Object { $have -cnotcontains $_ }).Count -gt 0) {
+        # Appended: the project's own lines - blank ones and comments
+        # included - are its owners', and used to be rewritten here.
+        Add-GitIgnoreLines -Root $script:SC_Repo -Lines $needed
         Write-Log 'this project had no .gitignore - added the sync rules so the engine stops announcing its own files' 'Yellow'
     }
+
+    # The first version is an upload like any other - usually the biggest one
+    # a project ever makes - so large content waits for the person's word
+    # here exactly as it does on every later publish.
+    if (Test-LargeHeld) { return $false }
 
     # Anything real to publish? The ignore file alone counts: it is the seed
     # every clone needs, and it is not the engine talking about itself.
@@ -945,6 +1015,7 @@ function Initialize-EmptyProject {
         git fetch -q origin $script:SC_Branch 2>$null | Out-Null
         return $false
     }
+    Clear-Approvals
     git branch --set-upstream-to "origin/$($script:SC_Branch)" 2>$null | Out-Null
     Write-Log "started this project: created '$($script:SC_Branch)' and published the first version" 'Green'
     return $true
@@ -1379,11 +1450,371 @@ function Get-DestructiveSignature {
     $sha  = [Security.Cryptography.SHA1]::Create()
     return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($text))) -replace '-', '').Substring(0, 12)
 }
+
+# --- large new content ------------------------------------------------------
+# The second thing a publish waits for a person's word on: something BIG
+# about to go out for the first time. Measured on the first real project: the
+# folder was 144 MB and 124 MB of it was node_modules - kept home only because
+# the project's own .gitignore happened to say so. Without that line every
+# byte would have gone, into a history that never forgets, and the next
+# `npm install` anywhere in any project would publish within four minutes.
+#
+# "Going out" means what the upload really carries, in two parts:
+#
+#   on the disk - new files that are not ignored, and files added or changed
+#                 since this machine's last commit. Sized from the disk.
+#   in commits  - every file version inside a commit made here that the team
+#                 does not have yet. A push sends commits, not the folder's
+#                 final state: something committed by hand and then deleted
+#                 still travels, inside the first commit.
+#
+# Content the team already has uploads nothing - a moved or copied file is
+# only a new name - so a file whose exact content the team already holds, or
+# that one of these commits already carries, does not count again.
+#
+# Each piece is filed under an ITEM, the thing a person would name: the
+# outermost folder the team does not have yet (all of node_modules/ is ONE
+# item, however many small files it holds, and however it got here), or else
+# the file itself. "Keep it home" names exactly that and nothing above it. An
+# item is held when one file in it is 25 MB or more (GitHub warns at 50 and
+# refuses at 100), or when it adds 50 MB or more in all.
+#
+# Shared marks a file the team already has: only its new version would go,
+# and keeping it home would mean taking it out of the project for everybody.
+# Committed marks content inside a commit made here, which keeping it home
+# has to take back out of that commit.
+$script:DG_FileLimit  = 25MB
+$script:DG_GroupLimit = 50MB
+$script:DG_TeamTree   = $null
+
+function Get-DGTeamTree {
+    # What the team has at $Rev: its folders, the content id of each file,
+    # and the size of each content id. Read once per version of the shared
+    # branch - it changes only when somebody publishes.
+    param([string]$Rev)
+    if ($script:DG_TeamTree -and $script:DG_TeamTree.Rev -eq $Rev) { return $script:DG_TeamTree }
+    $dirs  = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $files = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    $sizes = New-Object 'System.Collections.Generic.Dictionary[string,long]' ([StringComparer]::Ordinal)
+    if ($Rev) {
+        foreach ($t in @(Split-DGZ (Invoke-DGGit @('ls-tree', '-r', '-t', '-l', '-z', $Rev) "ls-tree $Rev"))) {
+            # "<mode> <type> <id> <size>`t<path>"
+            $tab = $t.IndexOf("`t")
+            if ($tab -lt 0) { continue }
+            $f = $t.Substring(0, $tab) -split ' +'
+            $path = $t.Substring($tab + 1)
+            if ($f[1] -eq 'tree') { [void]$dirs.Add($path) }
+            elseif ($f[1] -eq 'blob') { $files[$path] = $f[2]; $sizes[$f[2]] = [long]$f[3] }
+        }
+    }
+    $script:DG_TeamTree = @{ Rev = $Rev; Dirs = $dirs; Files = $files; Sizes = $sizes }
+    return $script:DG_TeamTree
+}
+
+function Get-DGCommitted {
+    # Every file version inside commits reachable from $Tip that the team
+    # does not have - what a push of $Tip carries besides the disk. Each
+    # content id once, under the first name git reports for it.
+    param([string]$Tip, [string]$Upstream)
+    $range = if ($Upstream) { @($Tip, '--not', $Upstream) } else { @($Tip) }
+    $named = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($line in @(Invoke-DGGit (@('rev-list', '--objects') + $range + @('--')) 'rev-list --objects')) {
+        # "<id> <path>"; a commit has no path, the top folder an empty one
+        $line = "$line"
+        $sp = $line.IndexOf(' ')
+        if ($sp -gt 0 -and $sp -lt ($line.Length - 1)) { $named.Add(@($line.Substring(0, $sp), $line.Substring($sp + 1))) }
+    }
+    $out = New-Object 'System.Collections.Generic.List[object]'
+    if ($named.Count -eq 0) { return ,$out }
+    $ErrorActionPreference = 'Continue'
+    $info = @($named | ForEach-Object { $_[0] } |
+              & git cat-file '--batch-check=%(objectname) %(objecttype) %(objectsize)' 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $info.Count -ne $named.Count) {
+        throw 'git could not answer the destructive check (cat-file sizes)'
+    }
+    for ($k = 0; $k -lt $named.Count; $k++) {
+        $f = "$($info[$k])".Split(' ')
+        if ($f.Count -ge 3 -and $f[1] -eq 'blob') {
+            $out.Add(@{ Path = $named[$k][1]; Blob = $f[0]; Size = [long]$f[2]; Committed = $true })
+        }
+    }
+    return ,$out
+}
+
+function Get-LargeOutgoingIn {
+    # Large content about to leave: one @{Item; Bytes; Files; Shared;
+    # Committed} per held item, ordinal by item. $Tip other than HEAD, with
+    # -CommittedOnly, measures what pushing that commit would carry.
+    param([string]$Root, [string]$Upstream, [string]$Tip = 'HEAD', [switch]$CommittedOnly)
+    $ErrorActionPreference = 'Continue'
+    $tipId = git rev-parse -q --verify "$Tip^{commit}" 2>$null
+    $tipId = if ($LASTEXITCODE -eq 0 -and $tipId) { "$tipId".Trim() } else { '' }
+    $upId = git rev-parse -q --verify "$Upstream^{commit}" 2>$null
+    $upId = if ($LASTEXITCODE -eq 0 -and $upId) { "$upId".Trim() } else { '' }
+
+    $pieces = New-Object 'System.Collections.Generic.List[object]'
+    if ($tipId) { foreach ($c in (Get-DGCommitted $tipId $upId)) { $pieces.Add($c) } }
+    if (-not $CommittedOnly) {
+        $disk = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($p in @(Split-DGZ (Invoke-DGGit @('ls-files', '-z', '--others', '--exclude-standard') 'ls-files --others'))) {
+            [void]$disk.Add($p)
+        }
+        if ($tipId) {
+            foreach ($letter in 'A', 'M') { foreach ($p in @(Get-DGChanged 'HEAD' $letter)) { [void]$disk.Add($p) } }
+        } else {
+            # Nothing committed yet: everything staged goes in the first commit.
+            foreach ($p in @(Split-DGZ (Invoke-DGGit @('ls-files', '-z') 'ls-files'))) { [void]$disk.Add($p) }
+        }
+        foreach ($p in $disk) {
+            # .NET rather than Test-Path/Get-Item: a folder nobody ignored can
+            # hold fifty thousand files, and this runs on every publish.
+            try { $fi = New-Object IO.FileInfo ([IO.Path]::Combine($Root, $p)) } catch { continue }
+            if ($fi.Exists) { $pieces.Add(@{ Path = $p; Blob = $null; Size = [long]$fi.Length; Committed = $false }) }
+        }
+    }
+    if ($pieces.Count -eq 0) { return }
+
+    $team = Get-DGTeamTree $upId
+    $items = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    $under = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    foreach ($pc in $pieces) {
+        $path = $pc.Path
+        $shared = $team.Files.ContainsKey($path)
+        $item = $path
+        $cut = $path.LastIndexOf('/')
+        if (-not $shared -and $cut -gt 0) {
+            # The outermost folder the team does not have - once per folder.
+            $dir = $path.Substring(0, $cut)
+            if (-not $under.ContainsKey($dir)) {
+                $owner = ''
+                $acc = ''
+                foreach ($part in $dir.Split('/')) {
+                    $acc = if ($acc) { "$acc/$part" } else { $part }
+                    if (-not $team.Dirs.Contains($acc)) { $owner = "$acc/"; break }
+                }
+                $under[$dir] = $owner
+            }
+            if ($under[$dir]) { $item = $under[$dir] }
+        }
+        if (-not $items.ContainsKey($item)) {
+            $items[$item] = @{ Item = $item; Shared = $shared; Pieces = New-Object 'System.Collections.Generic.List[object]' }
+        }
+        $items[$item].Pieces.Add($pc)
+    }
+
+    $measure = {
+        param($it)
+        $total = [long]0; $biggest = [long]0; $committed = $false
+        $paths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($pc in $it.Pieces) {
+            if ($pc.Known) { continue }
+            $total += $pc.Size
+            if ($pc.Size -gt $biggest) { $biggest = $pc.Size }
+            [void]$paths.Add($pc.Path)
+            if ($pc.Committed) { $committed = $true }
+        }
+        @{ Total = $total; Big = ($biggest -ge $script:DG_FileLimit -or $total -ge $script:DG_GroupLimit)
+           Files = $paths.Count; Committed = $committed }
+    }
+    $candidates = @($items.Values | Where-Object { (& $measure $_).Big })
+    if ($candidates.Count -eq 0) { return }
+
+    # Already there, or already on its way. Reading a file's content id means
+    # reading all of it, so a file is read only when that could change the
+    # answer: its size matches something known, AND without it the item
+    # would no longer be large. A folder of fresh downloads stays large
+    # whatever a few of its files turn out to be, and costs no reading.
+    $knownIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $knownSizes = New-Object 'System.Collections.Generic.HashSet[long]'
+    foreach ($kv in $team.Sizes.GetEnumerator()) { [void]$knownIds.Add($kv.Key); [void]$knownSizes.Add($kv.Value) }
+    foreach ($pc in $pieces) { if ($pc.Committed) { [void]$knownIds.Add($pc.Blob); [void]$knownSizes.Add($pc.Size) } }
+    $toHash = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($it in $candidates) {
+        $rest = [long]0; $restBig = [long]0
+        $maybe = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($pc in $it.Pieces) {
+            if ($pc.Committed) {
+                if ($team.Sizes.ContainsKey($pc.Blob)) { $pc.Known = $true; continue }
+            } elseif ($knownSizes.Contains($pc.Size)) {
+                $maybe.Add($pc.Path); continue
+            }
+            $rest += $pc.Size
+            if ($pc.Size -gt $restBig) { $restBig = $pc.Size }
+        }
+        if ($maybe.Count -gt 0 -and $restBig -lt $script:DG_FileLimit -and $rest -lt $script:DG_GroupLimit) {
+            $toHash.AddRange($maybe)
+        }
+    }
+    if ($toHash.Count -gt 0) {
+        $now = Get-DGWorkingBlobs -Root $Root -Paths @($toHash)
+        foreach ($it in $candidates) {
+            foreach ($pc in $it.Pieces) {
+                if (-not $pc.Committed -and $now.ContainsKey($pc.Path) -and $knownIds.Contains($now[$pc.Path])) { $pc.Known = $true }
+            }
+        }
+    }
+
+    $held = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    foreach ($it in $candidates) {
+        $m = & $measure $it
+        if ($m.Big) {
+            $held[$it.Item] = @{ Item = $it.Item; Bytes = $m.Total; Files = $m.Files
+                                 Shared = $it.Shared; Committed = $m.Committed }
+        }
+    }
+    # One item per pipeline object: callers collect them with @(...), which
+    # gives an empty array for none - never one nested array counted as one.
+    $names = [string[]]@($held.Keys)
+    [Array]::Sort($names, [StringComparer]::Ordinal)
+    foreach ($n in $names) { $held[$n] }
+}
+
+function Get-LargeSignature {
+    # One particular set of large items, so "send them" covers only those.
+    param($Large)
+    $all = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($l in @($Large)) { if ($l -and $l.Item) { $all.Add($l.Item) } }
+    if ($all.Count -eq 0) { return '' }
+    $all.Sort([StringComparer]::Ordinal)
+    $sha = [Security.Cryptography.SHA1]::Create()
+    return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($all -join "`n")))) -replace '-', '').Substring(0, 12)
+}
 # <<< destructive guard
 
 function Get-DestructiveChanges {
     # The engine's view: this repository, measured against the shared branch.
     Get-DestructiveChangesIn -Root $script:SC_Repo -Upstream "refs/remotes/origin/$($script:SC_Branch)"
+}
+
+function Get-LargeOutgoing {
+    Get-LargeOutgoingIn -Root $script:SC_Repo -Upstream "refs/remotes/origin/$($script:SC_Branch)"
+}
+
+function Approve-Large {
+    # "Send them": recorded against exactly these items, like a destructive OK.
+    param($Large)
+    git config --local teamsync.largeok (Get-LargeSignature $Large) 2>$null | Out-Null
+}
+
+function Test-LargeApproved {
+    param($Large)
+    $sig = Get-LargeSignature $Large
+    if (-not $sig) { return $true }
+    return ((git config --local --get teamsync.largeok 2>$null) -eq $sig)
+}
+
+function Format-LargeLine {
+    param($Item)
+    $what = if ($Item.Shared) { ', a new version of a file the team has' }
+            elseif ($Item.Committed) { ', inside a commit made here' } else { '' }
+    # Invariant digits, as the window shows them: "60.0" whatever the
+    # machine's own way of writing decimals.
+    $mb = ($Item.Bytes / 1MB).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture)
+    "{0} ({1} MB, {2} file(s){3})" -f $Item.Item, $mb, $Item.Files, $what
+}
+
+function Test-LargeHeld {
+    # True when large content waits for the person's word - said once per
+    # set, in the log and as an alert - or when the check itself could not be
+    # made: that is never read as "nothing large here".
+    try {
+        $large = @(Get-LargeOutgoing)
+        $script:SC_GuardFailSaid = $null
+    } catch {
+        $why = $_.Exception.Message
+        if ($script:SC_GuardFailSaid -ne $why) {
+            $script:SC_GuardFailSaid = $why
+            Write-Log "not publishing - $why; trying again on the next pass" 'Yellow'
+        }
+        return $true
+    }
+    $script:SC_Large = $large
+    if ($large.Count -eq 0 -or (Test-LargeApproved $large)) {
+        $script:SC_LargeSaid = $null
+        return $false
+    }
+    $sig = Get-LargeSignature $large
+    if ($script:SC_LargeSaid -ne $sig) {
+        $script:SC_LargeSaid = $sig
+        $lines = @($large | Select-Object -First 12 | ForEach-Object { Format-LargeLine $_ })
+        Write-Log 'publishing is PAUSED - this would upload large new content' 'Red'
+        foreach ($l in $lines) { Write-Log "  $l" 'Yellow' }
+        Write-Log '  send it, or keep it home, in the app - nothing goes out until you do' 'Yellow'
+        Show-Alert -Title 'teamsync: large new content waiting' -Body (
+            "Publishing is paused.`n`n" + ($lines -join "`n") + "`n`n" +
+            "Once sent, it stays in the project's history for good. If it can be " +
+            "rebuilt on each machine (installed libraries, caches), keep it home.") -OpenFolder $script:SC_Repo
+    }
+    return $true
+}
+
+function Clear-Approvals {
+    # A "yes" covers the publish it was given for, and nothing after it: the
+    # same names deleted again next month, or a different big folder under an
+    # approved name, ask again.
+    git config --local --unset teamsync.destructiveok 2>$null | Out-Null
+    git config --local --unset teamsync.largeok 2>$null | Out-Null
+}
+
+function Format-GitIgnoreLine {
+    # One exact path as a .gitignore line: anchored to the project root, so it
+    # names this item and never a same-named one elsewhere, with git's
+    # pattern characters escaped so a name like "[draft].md" means itself.
+    param([string]$Path)
+    $escaped = ($Path -replace '([\[\]\*\?\\])', '\$1')
+    if ($escaped.StartsWith('#') -or $escaped.StartsWith('!')) { $escaped = '\' + $escaped }
+    return '/' + $escaped
+}
+
+function Keep-LargeHome {
+    # "Keep them home": each item goes into .gitignore, so it is never sent -
+    # and the .gitignore travels, so no other machine sends its own copy
+    # either. An item already tracked here is also taken out of the index.
+    #
+    # A file the team already has is not kept home this way: that would take
+    # it out of the project for everybody. Only new items are.
+    #
+    # Something already inside a commit made here would still travel - a push
+    # sends commits, not the folder's final state. So the commits not yet
+    # sent are folded back into the next one first: every file stays exactly
+    # as it is on the disk, only the unsent steps between are let go. Throws
+    # when that cannot be done safely.
+    param($Large)
+    $new = @(@($Large) | Where-Object { -not $_.Shared })
+    if (@($new | Where-Object { $_.Committed }).Count -gt 0) {
+        $gitDir = git rev-parse --git-dir 2>$null
+        if ((Test-Rebasing) -or ($gitDir -and (Test-Path -LiteralPath (Join-Path $gitDir 'MERGE_HEAD')))) {
+            throw 'a merge is still being finished here - try again once it is done'
+        }
+        $base = git merge-base HEAD "refs/remotes/origin/$($script:SC_Branch)" 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $base) {
+            throw "it is already in this folder's own history, which goes up as it is"
+        }
+        git reset -q --soft "$base".Trim() 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'git could not set the unsent commits aside' }
+    }
+    Add-GitIgnoreLines -Root $script:SC_Repo -Lines @($new | ForEach-Object { Format-GitIgnoreLine $_.Item })
+    foreach ($l in $new) {
+        git --literal-pathspecs rm -r -q --cached --ignore-unmatch -- $l.Item.TrimEnd('/') 2>$null | Out-Null
+    }
+    git config --local --unset teamsync.largeok 2>$null | Out-Null
+}
+
+function Add-GitIgnoreLines {
+    # APPENDS the lines the file lacks - the project's own lines, blank lines
+    # and comments are its owners' and are never rewritten - in the line
+    # ending the file already uses.
+    param([string]$Root, [string[]]$Lines)
+    $ignore = Join-Path $Root '.gitignore'
+    $text = ''
+    if (Test-Path -LiteralPath $ignore) { $text = [IO.File]::ReadAllText($ignore) }
+    $have = @($text -split "`r?`n")
+    $nl = if ($text.Contains("`r`n") -or -not $text) { "`r`n" } else { "`n" }
+    $add = @($Lines | Where-Object { $_ -and $have -cnotcontains $_ } | Select-Object -Unique)
+    if ($add.Count -eq 0) { return }
+    if ($text -and -not $text.EndsWith("`n")) { $text += $nl }
+    $text += ($add -join $nl) + $nl
+    [IO.File]::WriteAllText($ignore, $text, (New-Object Text.UTF8Encoding($false)))
 }
 
 function Approve-Destructive {
@@ -1798,6 +2229,10 @@ function Invoke-Publish {
         $script:SC_DestructiveSaid = $null
     }
 
+    # Something LARGE going out for the first time waits too - see the large
+    # new content part of the guard block for why.
+    if (Test-LargeHeld) { return $false }
+
     Invoke-CommitLocal | Out-Null
     $ahead = Get-AheadCount
     if ($ahead -eq 0) {
@@ -1826,6 +2261,7 @@ function Invoke-Publish {
         if ($LASTEXITCODE -ne 0) { Set-NetState $false; return $false }
     }
     Set-NetState $true
+    Clear-Approvals
     # Published means the announced work is out - however the publish happened.
     # push-now clears this too, but the engine's own quiet-window publish must
     # not leave a stale announcement holding the other side's downloads.

@@ -56,7 +56,8 @@ When a piece of work is FINISHED:
 Exit 0 = published (this also clears your announcement). Exit 1 = offline -
 tell the user, do not retry in a loop; the work is committed and the engine
 publishes it by itself when the connection returns. Exit 2 = conflict, see
-below. Exit 3 = this would destroy work, see below.
+below. Exit 3 = this would destroy work, or upload something large - see
+below.
 
 ## Exit 3 - it would delete or roll back somebody's work
 
@@ -82,6 +83,23 @@ every teammate's machine.
 
 Do NOT `git rm`, `git commit` or `git checkout` your way past it, or edit the
 config that records the confirmation. Report what was named, and wait.
+
+## Exit 3 - it would upload something large
+
+The same exit, for a different reason: one file of 25 MB or more, or one new
+folder adding 50 MB or more, is about to be uploaded. Once uploaded it stays in
+the project's history for good. push-now names it, e.g.
+`node_modules/ (124.0 MB ...)`; `-CheckOnly` lists it as `large: ...`.
+
+Committing first changes nothing - it counts what the upload really carries,
+including something committed and deleted again. A moved or copied file
+counts for nothing.
+
+**It is your human's decision.** Installed libraries, caches and build output
+belong at home ("Keep them home" in the TeamSync window - into .gitignore, and
+out of any unsent commit); real work that is simply big, they send ("Send
+them"). Do not `git rm --cached`, edit `.gitignore` or commit your way past it.
+Report what was named, and wait.
 
 ## Conflicts
 

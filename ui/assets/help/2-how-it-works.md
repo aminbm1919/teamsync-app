@@ -27,7 +27,9 @@ The lights (top right)
 
 The buttons
   Publish now      send finished work immediately (AI agents use push-now.ps1)
-  Stop sync        pause the engine (closing the window does NOT stop it)
+  Stop sync        pause the engine (closing the window does NOT stop it);
+                   it says Stopping... for a few seconds while the engine
+                   finishes what it is in the middle of
   Open folder      the project in Explorer
   Change folder    move the project somewhere else, safely, while syncing
   History          older log lines - the live log keeps about a day and
@@ -49,6 +51,19 @@ Publishing
   ground does not move under them. Publish now still sends immediately - that
   is your decision, and decisions stay with the people. If a conflict is left
   open for ten minutes the backstop starts again by itself.
+
+What is shared, and what stays on this machine
+  Everything in the project folder is shared, except:
+    - what the project's own .gitignore names;
+    - what tools rebuild on every machine: node_modules, Python's caches and
+      virtual environments, the system's thumbnail files;
+    - what you chose to keep home when the folder was first shared.
+  The .gitignore travels with the project, so whatever is kept home stays home
+  on every machine, not only on yours.
+
+  Large content waits for your word: one file of 25 MB or more, or a new
+  folder adding 50 MB or more. "Needs your OK" lists it - keep it home, or
+  send it. Once sent it stays in the project's history for good.
 
 Conflicts (red light)
   Your work and the shared branch changed the same lines. Nothing was pushed,
@@ -83,11 +98,14 @@ Names
   Everyone must publish under a different name (git config user.name) - it is
   what ties presence, warnings and authorship together. The app refuses to
   start on a name already held by a different GitHub account. One person on
-  two machines is not a collision: the second is numbered automatically, so
-  "amin" and "amin-2" are one person at two desks.
+  two machines is not a collision: both desks show as that one name, because
+  the team works with people, not with computers.
 
 Updates
   The app offers a new version with its size and date - NOTHING downloads
   until you press the button. What arrives is signature-checked against a key
   built into the app, then handed to your own antivirus, then swapped in by a
   helper that puts the old version back if anything fails.
+  Every project's background engine moves to the new version too, the next
+  time the app starts - while it rests between two rounds of work, never in
+  the middle of one. A project whose syncing was off stays off.

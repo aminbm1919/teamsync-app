@@ -2,11 +2,12 @@
 #
 # Role   : publish immediately instead of waiting out the 4-minute quiet window.
 # Input  : none. Run it from anywhere inside the project folder.
-#          -CheckOnly publishes nothing: it lists what the destructive guard
-#          would hold back, and exits 0.
+#          -CheckOnly publishes nothing: it lists what the guard would hold
+#          back - work it would destroy, and large content - and exits 0.
 # Output : your work on GitHub, or a clear reason why not. Exit code 0 = published
 #          (or nothing to publish), 1 = blocked, 2 = conflict, 3 = this would
-#          delete or roll back work and needs a human's word first.
+#          delete or roll back work, or upload large new content, and needs a
+#          human's word first.
 # Never  : force-pushes or discards anything.
 #
 #   pwsh push-now.ps1
@@ -360,10 +361,240 @@ function Get-DestructiveSignature {
     $sha  = [Security.Cryptography.SHA1]::Create()
     return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($text))) -replace '-', '').Substring(0, 12)
 }
+
+# --- large new content ------------------------------------------------------
+# The second thing a publish waits for a person's word on: something BIG
+# about to go out for the first time. Measured on the first real project: the
+# folder was 144 MB and 124 MB of it was node_modules - kept home only because
+# the project's own .gitignore happened to say so. Without that line every
+# byte would have gone, into a history that never forgets, and the next
+# `npm install` anywhere in any project would publish within four minutes.
+#
+# "Going out" means what the upload really carries, in two parts:
+#
+#   on the disk - new files that are not ignored, and files added or changed
+#                 since this machine's last commit. Sized from the disk.
+#   in commits  - every file version inside a commit made here that the team
+#                 does not have yet. A push sends commits, not the folder's
+#                 final state: something committed by hand and then deleted
+#                 still travels, inside the first commit.
+#
+# Content the team already has uploads nothing - a moved or copied file is
+# only a new name - so a file whose exact content the team already holds, or
+# that one of these commits already carries, does not count again.
+#
+# Each piece is filed under an ITEM, the thing a person would name: the
+# outermost folder the team does not have yet (all of node_modules/ is ONE
+# item, however many small files it holds, and however it got here), or else
+# the file itself. "Keep it home" names exactly that and nothing above it. An
+# item is held when one file in it is 25 MB or more (GitHub warns at 50 and
+# refuses at 100), or when it adds 50 MB or more in all.
+#
+# Shared marks a file the team already has: only its new version would go,
+# and keeping it home would mean taking it out of the project for everybody.
+# Committed marks content inside a commit made here, which keeping it home
+# has to take back out of that commit.
+$script:DG_FileLimit  = 25MB
+$script:DG_GroupLimit = 50MB
+$script:DG_TeamTree   = $null
+
+function Get-DGTeamTree {
+    # What the team has at $Rev: its folders, the content id of each file,
+    # and the size of each content id. Read once per version of the shared
+    # branch - it changes only when somebody publishes.
+    param([string]$Rev)
+    if ($script:DG_TeamTree -and $script:DG_TeamTree.Rev -eq $Rev) { return $script:DG_TeamTree }
+    $dirs  = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $files = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    $sizes = New-Object 'System.Collections.Generic.Dictionary[string,long]' ([StringComparer]::Ordinal)
+    if ($Rev) {
+        foreach ($t in @(Split-DGZ (Invoke-DGGit @('ls-tree', '-r', '-t', '-l', '-z', $Rev) "ls-tree $Rev"))) {
+            # "<mode> <type> <id> <size>`t<path>"
+            $tab = $t.IndexOf("`t")
+            if ($tab -lt 0) { continue }
+            $f = $t.Substring(0, $tab) -split ' +'
+            $path = $t.Substring($tab + 1)
+            if ($f[1] -eq 'tree') { [void]$dirs.Add($path) }
+            elseif ($f[1] -eq 'blob') { $files[$path] = $f[2]; $sizes[$f[2]] = [long]$f[3] }
+        }
+    }
+    $script:DG_TeamTree = @{ Rev = $Rev; Dirs = $dirs; Files = $files; Sizes = $sizes }
+    return $script:DG_TeamTree
+}
+
+function Get-DGCommitted {
+    # Every file version inside commits reachable from $Tip that the team
+    # does not have - what a push of $Tip carries besides the disk. Each
+    # content id once, under the first name git reports for it.
+    param([string]$Tip, [string]$Upstream)
+    $range = if ($Upstream) { @($Tip, '--not', $Upstream) } else { @($Tip) }
+    $named = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($line in @(Invoke-DGGit (@('rev-list', '--objects') + $range + @('--')) 'rev-list --objects')) {
+        # "<id> <path>"; a commit has no path, the top folder an empty one
+        $line = "$line"
+        $sp = $line.IndexOf(' ')
+        if ($sp -gt 0 -and $sp -lt ($line.Length - 1)) { $named.Add(@($line.Substring(0, $sp), $line.Substring($sp + 1))) }
+    }
+    $out = New-Object 'System.Collections.Generic.List[object]'
+    if ($named.Count -eq 0) { return ,$out }
+    $ErrorActionPreference = 'Continue'
+    $info = @($named | ForEach-Object { $_[0] } |
+              & git cat-file '--batch-check=%(objectname) %(objecttype) %(objectsize)' 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $info.Count -ne $named.Count) {
+        throw 'git could not answer the destructive check (cat-file sizes)'
+    }
+    for ($k = 0; $k -lt $named.Count; $k++) {
+        $f = "$($info[$k])".Split(' ')
+        if ($f.Count -ge 3 -and $f[1] -eq 'blob') {
+            $out.Add(@{ Path = $named[$k][1]; Blob = $f[0]; Size = [long]$f[2]; Committed = $true })
+        }
+    }
+    return ,$out
+}
+
+function Get-LargeOutgoingIn {
+    # Large content about to leave: one @{Item; Bytes; Files; Shared;
+    # Committed} per held item, ordinal by item. $Tip other than HEAD, with
+    # -CommittedOnly, measures what pushing that commit would carry.
+    param([string]$Root, [string]$Upstream, [string]$Tip = 'HEAD', [switch]$CommittedOnly)
+    $ErrorActionPreference = 'Continue'
+    $tipId = git rev-parse -q --verify "$Tip^{commit}" 2>$null
+    $tipId = if ($LASTEXITCODE -eq 0 -and $tipId) { "$tipId".Trim() } else { '' }
+    $upId = git rev-parse -q --verify "$Upstream^{commit}" 2>$null
+    $upId = if ($LASTEXITCODE -eq 0 -and $upId) { "$upId".Trim() } else { '' }
+
+    $pieces = New-Object 'System.Collections.Generic.List[object]'
+    if ($tipId) { foreach ($c in (Get-DGCommitted $tipId $upId)) { $pieces.Add($c) } }
+    if (-not $CommittedOnly) {
+        $disk = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($p in @(Split-DGZ (Invoke-DGGit @('ls-files', '-z', '--others', '--exclude-standard') 'ls-files --others'))) {
+            [void]$disk.Add($p)
+        }
+        if ($tipId) {
+            foreach ($letter in 'A', 'M') { foreach ($p in @(Get-DGChanged 'HEAD' $letter)) { [void]$disk.Add($p) } }
+        } else {
+            # Nothing committed yet: everything staged goes in the first commit.
+            foreach ($p in @(Split-DGZ (Invoke-DGGit @('ls-files', '-z') 'ls-files'))) { [void]$disk.Add($p) }
+        }
+        foreach ($p in $disk) {
+            # .NET rather than Test-Path/Get-Item: a folder nobody ignored can
+            # hold fifty thousand files, and this runs on every publish.
+            try { $fi = New-Object IO.FileInfo ([IO.Path]::Combine($Root, $p)) } catch { continue }
+            if ($fi.Exists) { $pieces.Add(@{ Path = $p; Blob = $null; Size = [long]$fi.Length; Committed = $false }) }
+        }
+    }
+    if ($pieces.Count -eq 0) { return }
+
+    $team = Get-DGTeamTree $upId
+    $items = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    $under = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    foreach ($pc in $pieces) {
+        $path = $pc.Path
+        $shared = $team.Files.ContainsKey($path)
+        $item = $path
+        $cut = $path.LastIndexOf('/')
+        if (-not $shared -and $cut -gt 0) {
+            # The outermost folder the team does not have - once per folder.
+            $dir = $path.Substring(0, $cut)
+            if (-not $under.ContainsKey($dir)) {
+                $owner = ''
+                $acc = ''
+                foreach ($part in $dir.Split('/')) {
+                    $acc = if ($acc) { "$acc/$part" } else { $part }
+                    if (-not $team.Dirs.Contains($acc)) { $owner = "$acc/"; break }
+                }
+                $under[$dir] = $owner
+            }
+            if ($under[$dir]) { $item = $under[$dir] }
+        }
+        if (-not $items.ContainsKey($item)) {
+            $items[$item] = @{ Item = $item; Shared = $shared; Pieces = New-Object 'System.Collections.Generic.List[object]' }
+        }
+        $items[$item].Pieces.Add($pc)
+    }
+
+    $measure = {
+        param($it)
+        $total = [long]0; $biggest = [long]0; $committed = $false
+        $paths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($pc in $it.Pieces) {
+            if ($pc.Known) { continue }
+            $total += $pc.Size
+            if ($pc.Size -gt $biggest) { $biggest = $pc.Size }
+            [void]$paths.Add($pc.Path)
+            if ($pc.Committed) { $committed = $true }
+        }
+        @{ Total = $total; Big = ($biggest -ge $script:DG_FileLimit -or $total -ge $script:DG_GroupLimit)
+           Files = $paths.Count; Committed = $committed }
+    }
+    $candidates = @($items.Values | Where-Object { (& $measure $_).Big })
+    if ($candidates.Count -eq 0) { return }
+
+    # Already there, or already on its way. Reading a file's content id means
+    # reading all of it, so a file is read only when that could change the
+    # answer: its size matches something known, AND without it the item
+    # would no longer be large. A folder of fresh downloads stays large
+    # whatever a few of its files turn out to be, and costs no reading.
+    $knownIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $knownSizes = New-Object 'System.Collections.Generic.HashSet[long]'
+    foreach ($kv in $team.Sizes.GetEnumerator()) { [void]$knownIds.Add($kv.Key); [void]$knownSizes.Add($kv.Value) }
+    foreach ($pc in $pieces) { if ($pc.Committed) { [void]$knownIds.Add($pc.Blob); [void]$knownSizes.Add($pc.Size) } }
+    $toHash = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($it in $candidates) {
+        $rest = [long]0; $restBig = [long]0
+        $maybe = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($pc in $it.Pieces) {
+            if ($pc.Committed) {
+                if ($team.Sizes.ContainsKey($pc.Blob)) { $pc.Known = $true; continue }
+            } elseif ($knownSizes.Contains($pc.Size)) {
+                $maybe.Add($pc.Path); continue
+            }
+            $rest += $pc.Size
+            if ($pc.Size -gt $restBig) { $restBig = $pc.Size }
+        }
+        if ($maybe.Count -gt 0 -and $restBig -lt $script:DG_FileLimit -and $rest -lt $script:DG_GroupLimit) {
+            $toHash.AddRange($maybe)
+        }
+    }
+    if ($toHash.Count -gt 0) {
+        $now = Get-DGWorkingBlobs -Root $Root -Paths @($toHash)
+        foreach ($it in $candidates) {
+            foreach ($pc in $it.Pieces) {
+                if (-not $pc.Committed -and $now.ContainsKey($pc.Path) -and $knownIds.Contains($now[$pc.Path])) { $pc.Known = $true }
+            }
+        }
+    }
+
+    $held = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    foreach ($it in $candidates) {
+        $m = & $measure $it
+        if ($m.Big) {
+            $held[$it.Item] = @{ Item = $it.Item; Bytes = $m.Total; Files = $m.Files
+                                 Shared = $it.Shared; Committed = $m.Committed }
+        }
+    }
+    # One item per pipeline object: callers collect them with @(...), which
+    # gives an empty array for none - never one nested array counted as one.
+    $names = [string[]]@($held.Keys)
+    [Array]::Sort($names, [StringComparer]::Ordinal)
+    foreach ($n in $names) { $held[$n] }
+}
+
+function Get-LargeSignature {
+    # One particular set of large items, so "send them" covers only those.
+    param($Large)
+    $all = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($l in @($Large)) { if ($l -and $l.Item) { $all.Add($l.Item) } }
+    if ($all.Count -eq 0) { return '' }
+    $all.Sort([StringComparer]::Ordinal)
+    $sha = [Security.Cryptography.SHA1]::Create()
+    return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($all -join "`n")))) -replace '-', '').Substring(0, 12)
+}
 # <<< destructive guard
 
 try {
     $held = Get-DestructiveChangesIn -Root $repo -Upstream 'refs/remotes/origin/main'
+    $large = @(Get-LargeOutgoingIn -Root $repo -Upstream 'refs/remotes/origin/main')
 } catch {
     Say "Could not check whether this would delete or roll back work: $($_.Exception.Message)" 'Red'
     Say 'Nothing was published. Run it again in a moment; if it keeps failing, tell your human.' 'Yellow'
@@ -373,7 +604,28 @@ if ($CheckOnly) {
     foreach ($f in $held.Deleted)  { Write-Output "deleted: $f" }
     foreach ($f in $held.Reverted) { Write-Output "rolled back: $f" }
     Write-Output ('signature: ' + (Get-DestructiveSignature $held))
+    foreach ($l in $large) {
+        $what = if ($l.Shared) { ', already in the project' } elseif ($l.Committed) { ', inside a commit made here' } else { '' }
+        Write-Output ("large: {0} ({1} bytes, {2} files{3})" -f $l.Item, $l.Bytes, $l.Files, $what)
+    }
+    Write-Output ('large signature: ' + (Get-LargeSignature $large))
     exit 0
+}
+# Large content waits for a person too: once sent it is in the history for
+# good, and most of what is that big (installed libraries, caches, build
+# output) can be rebuilt on each machine instead.
+if ($large.Count -gt 0 -and (git config --local --get teamsync.largeok 2>$null) -ne (Get-LargeSignature $large)) {
+    Say 'This would upload LARGE content. Nothing was published.' 'Red'
+    foreach ($l in ($large | Select-Object -First 12)) {
+        $what = if ($l.Shared) { ', a new version of a file the team has' } elseif ($l.Committed) { ', inside a commit made here' } else { '' }
+        $mb = ($l.Bytes / 1MB).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture)
+        Say ("  {0} ({1} MB{2})" -f $l.Item, $mb, $what) 'Yellow'
+    }
+    if ($large.Count -gt 12) { Say "  ... and $($large.Count - 12) more" 'Yellow' }
+    Say ''
+    Say 'Keep it home or send it: TeamSync window > Needs your OK. Then run this again.' 'Yellow'
+    Say 'Agents: this is a decision for your human.' 'Yellow'
+    exit 3
 }
 $destroyed = @(@($held.Deleted | ForEach-Object { "deleted: $_" }) +
                @($held.Reverted | ForEach-Object { "rolled back: $_" }))
@@ -570,6 +822,9 @@ if ($LASTEXITCODE -ne 0) {
 
 git push -q origin main 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) { Say 'Push failed. Check the network or VPN, then try again.' 'Yellow'; exit 1 }
+# A "yes" covers the publish it was given for, and nothing after it.
+git config --local --unset teamsync.destructiveok 2>$null | Out-Null
+git config --local --unset teamsync.largeok 2>$null | Out-Null
 # Published means the work is out - whatever was announced as "in progress"
 # is in progress no longer.
 Remove-Item -LiteralPath (Join-Path $repo '.teamsync-agent.json') -Force -ErrorAction SilentlyContinue

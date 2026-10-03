@@ -239,7 +239,7 @@ Tick the box beside it first. That marks you as the volunteer, and for
 everybody else the button disappears and your name shows instead — two people
 settling the same file separately is not help, it is the next conflict.
 
-## 5b. Exit 3 — it would destroy work
+## 5b. Exit 3 — it would destroy work, or upload something large
 
 Adding work needs no permission. Destroying it does. When what is about to be
 published DELETES a file, or puts a file back to an older version of itself,
@@ -275,6 +275,32 @@ deleted.
 Never route around it: no `git rm` and `git commit` by hand (a committed
 deletion is held just the same), no hand-editing the config that records the
 confirmation, no pushing by hand.
+
+**Large content waits for the same word.** When what is about to be uploaded
+holds one file of 25 MB or more, or one item adding 50 MB or more, push-now
+stops with exit 3 and names it - for example `node_modules/ (124.0 MB ...)`.
+Once uploaded it is in the project's history for good: deleting it later takes
+it out of the folder, never out of the history every clone carries.
+
+- An "item" is the outermost folder the team does not have yet (all of a new
+  `node_modules/` is one item) or a single file. A file the team already has,
+  changed, is its own item - every new version goes into the history in full.
+- It counts what the upload really carries: committing first changes nothing,
+  and something committed and deleted again still counts, because a push
+  sends commits, not the folder's final state. A moved or copied file counts
+  for nothing - the team already has its content.
+- `-CheckOnly` lists these as `large: <item> (<bytes> bytes, <files> files)`.
+- Installed libraries, caches and build output can be rebuilt on each
+  machine: the person presses **Keep them home** in "Needs your OK" - the item
+  goes into `.gitignore` (which travels, so no other machine sends its copy
+  either), and anything of it already inside a commit made here and not sent
+  is taken back out of that commit; every file stays on the disk as it is.
+  Real work that is simply big: **Send them**.
+- A "yes" covers one publish. The same name, grown again later, is asked
+  about again.
+
+Do not `git rm --cached`, edit `.gitignore` or commit your way past it on your
+own - report what was named, and wait for the person.
 
 ## 6. Never
 
